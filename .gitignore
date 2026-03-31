@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data and Models
+**/checkpoints/
+**/models/*
+**/*.pth           # PyTorch model files
+**/logs/
+**/runs/
+
+# Large files
+*.zip
+*.tar.gz
+
+# Generated files
+**/prediction*.csv
+**/validation_errors.csv
+**/class_accuracy.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data directories (too large to push)
+**/data/
