@@ -157,9 +157,19 @@ All training parameters are centralized in `config.py`:
 
 ## Performance Snapshot
 
+### Training Visualization
+
+#### Accuracy Curves
+![Training Accuracy](Train_acc.png)
+![Validation Accuracy](Val_acc.png)
+
+#### Loss Curves
+![Training Loss](Train_loss.png)
+![Validation Loss](Val_loss.png)
+
 ### Validation Metrics (Latest Training Run)
-- **Validation Accuracy:** ~92%
-- **Top-5 Accuracy:** ~97%
+- **Validation Accuracy:** ~91.67%
+- **Top-5 Accuracy:** ~97.33%
 - **Best Epoch:** 61
 
 ### Class-wise Performance
@@ -191,113 +201,6 @@ All training parameters are centralized in `config.py`:
 
 ---
 
-## Project Structure
-
-```
-HW1/
-├── train.py                 # Main training script
-├── inference.py             # Test set inference
-├── config.py               # Centralized configuration
-├── utils.py                # Utility functions
-├── README.md               # This file
-├── data/
-│   ├── train/              # Training images (20,724)
-│   ├── val/                # Validation images (300)
-│   └── test/               # Test images (2,344)
-├── checkpoints/            # Saved model checkpoints
-├── models/
-│   └── best_model.pth      # Best validation checkpoint
-├── logs/                   # Training logs
-├── runs/                   # TensorBoard logs
-└── prediction.csv          # Test predictions (generated)
-```
-
----
-
-## Key Implementation Details
-
-### Data Pipeline
-1. **Resize:** 256×256
-2. **Random Crop:** 224×224 for training, Center Crop for validation/test
-3. **Augmentations:** Applied in specific order (PIL → Tensor → Normalize)
-4. **Normalization:** ImageNet standard (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-### Loss Function
-- **Type:** CrossEntropyLoss
-- **Label Smoothing:** 0.1
-- **Class Weighting:** Disabled (uniform weights)
-
-### Optimizer
-- **Type:** SGD with momentum
-- **Momentum:** 0.9
-- **Weight Decay:** 3e-4 (L2 regularization)
-
----
-
-## Troubleshooting
-
-### CUDA Out of Memory
-- Reduce BATCH_SIZE in config.py
-- Clear GPU cache: `torch.cuda.empty_cache()`
-- Use smaller model (ecaresnet50d instead of resnext101)
-
-### Learning Rate Scheduler Optimization
-**Issue:** Initially used cosine annealing scheduler, but observed poor loss reduction in later training epochs.
-
-**Solution:** Switched to **MultiStepLR** scheduler with milestones at [30, 120] epochs. This multi-stage decay approach provided more stable convergence and better loss decrease in the final training phase.
-
-### Validation Accuracy Plateau
-**Issue:** Validation accuracy plateaued around 92% and couldn't improve further.
-
-**Root Cause Analysis:** Dataset analysis revealed that the challenging classes consist primarily of:
-- **Fine-grained bird species:** Subtle differences in feather patterns, coloration, and size
-- **Plant details:** Minute variations in leaf patterns, flower structures, and plant morphology
-
-These features require higher discriminative capacity to distinguish effectively.
-
-**Attempted Solutions:**
-1. **Attention-based models:** Tested squeeze-and-excitation networks and channel attention mechanisms
-   - Result: Minimal improvement (~0.5% accuracy gain)
-   
-2. **iNaturalist pre-training:** Experimented with models pre-trained on iNaturalist dataset (domain-specific)
-   - Result: Limited effectiveness on this specific dataset
-
-**Final Solution:** Switched to **larger capacity models** (ECA-ResNet50d, ResNeXt-101) with more parameters to better capture fine-grained visual features. The increased model capacity enabled better learning of subtle discriminative patterns.
-
-**Challenging Classes (Analysis):**
-- Class 11 (Birds): ~50% accuracy - Fine feather distinctions
-- Class 20 & 26 (Plants): ~40% accuracy - Highly similar leaf structures
-- Class 44, 58, 72 (Mixed): ~35-45% accuracy - Subtle morphological differences
-
-
----
-
-## Citation & References
-
-### Model Architectures
-- **ECA-ResNet:** ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks (Wang et al., 2020) - https://arxiv.org/abs/1910.03151
-- **Squeeze-and-Excitation Networks:** Hu et al., 2018 - https://arxiv.org/abs/1709.01507
-- **CBAM: Convolutional Block Attention Module:** Woo et al., 2018 - https://arxiv.org/abs/1807.06521
-- **BAM: Bottleneck Attention Module:** Park et al., 2018 - https://arxiv.org/abs/1807.06674
-- **ResNet:** Deep Residual Learning for Image Recognition (He et al., 2015)
-- **ResNeXt:** Aggregated Residual Transformations for Deep Neural Networks (Xie et al., 2017)
-
-### Data Augmentation
-- **RandAugment:** RandAugment: Practical automated data augmentation with a reduced search space (Cubuk et al., 2019)
-- **CutMix:** CutMix: Regularization Strategy to Train Strong Classifiers (Yun et al., 2019) - https://arxiv.org/abs/1905.04412
-- **AutoAugment:** AutoAugment: Learning Augmentation Policies from Data (Cubuk et al., 2019)
-- **Mixup:** mixup: Beyond Empirical Risk Minimization (Zhang et al., 2017)
-
-### Fine-grained Image Recognition
-- **Fine-Grained Visual Categorization of Aircraft:** Fine-Grained Visual Categorization of Aircraft (Maji et al., 2013)
-- **The iNaturalist Species Classification and Detection Dataset:** Horn et al., 2018
-- **Attention-based Deep Multiple Instance Learning:** Ilse et al., 2018
-
-### Related Techniques
-- **Label Smoothing:** When Does Label Smoothing Help? (Müller et al., 2019)
-- **Warmup Strategies:** A Closer Look at Deep Learning Heuristics: Learning rate restart Warmup and Decay (Gotmare et al., 2018)
-
----
 
 
 **Last Updated:** 2026-03-31  
