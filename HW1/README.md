@@ -1,7 +1,7 @@
 # NYCU Computer Vision 2026 HW1 - 100-Class Image Classification
 
-**Student ID:** 123456789  
-**Name:** Your Name
+**Student ID:** 112550200
+**Name:** Zheng WU QIAN
 
 ---
 
@@ -28,7 +28,7 @@ This project implements a deep learning-based image classification model for a 1
 ## Environment Setup
 
 ### Prerequisites:
-- Python 3.10+
+- Python 3.9+
 - CUDA 12.8 (for GPU acceleration)
 - cuDNN support for PyTorch
 
@@ -36,7 +36,7 @@ This project implements a deep learning-based image classification model for a 1
 
 ```bash
 # Clone the repository
-git clone <your-github-repo>
+git clone https://github.com/milktea7654/Visual-Recognitionusing-Deep-Learning-2026-Spring
 cd HW1
 
 # Create virtual environment (optional)
@@ -85,8 +85,8 @@ python train.py --model ecaresnet50d
 #### Custom Training Arguments
 ```bash
 python train.py \
-    --model ecaresnet50d \
-    --epochs 200 \
+    --model resnext101_32x8d \
+    --epochs 150 \
     --batch-size 32 \
     --lr 0.008 \
     --device cuda
@@ -153,17 +153,14 @@ All training parameters are centralized in `config.py`:
 | RandAugment | N=2, M=9 |
 | CutMix | alpha=1.0, probability=0.5 |
 
-For detailed configuration, see [CURRENT_CONFIG.md](CURRENT_CONFIG.md).
-
 ---
 
 ## Performance Snapshot
 
 ### Validation Metrics (Latest Training Run)
-- **Validation Accuracy:** ~90%
+- **Validation Accuracy:** ~92%
 - **Top-5 Accuracy:** ~97%
-- **Validation Error Rate:** 11.3% (34/300 misclassified)
-- **Best Epoch:** 77
+- **Best Epoch:** 61
 
 ### Class-wise Performance
 **Highest Accuracy Classes:** 
@@ -183,18 +180,14 @@ For detailed configuration, see [CURRENT_CONFIG.md](CURRENT_CONFIG.md).
 - Class 5 → Class 8: 2 instances
 
 ### Training Time
-- **Estimated Duration:** 2.5 hours (RTX 3090)
-- **Memory Usage:** ~6GB VRAM
+- **Estimated Duration:** 5.5 hours (RTX 5070 Ti)
+- **Memory Usage:** ~14GB VRAM
 
 ### Model Size
-- **ECA-ResNet50d:** 25M parameters
 - **ResNeXt-101 32x8d:** 88M parameters
-- **ResNet-101:** 44M parameters
-- **All models:** < 100M parameter constraint ✓
 
 ### Test Set Performance
-- **Latest Submission Score:** [Update with actual score]
-- **Expected Accuracy:** 87-89%
+- **Latest Submission Score:** 0.96
 
 ---
 
@@ -206,8 +199,6 @@ HW1/
 ├── inference.py             # Test set inference
 ├── config.py               # Centralized configuration
 ├── utils.py                # Utility functions
-├── analyze_predictions.py   # Error analysis
-├── CURRENT_CONFIG.md        # Detailed hyperparameters
 ├── README.md               # This file
 ├── data/
 │   ├── train/              # Training images (20,724)
@@ -224,10 +215,6 @@ HW1/
 ---
 
 ## Key Implementation Details
-
-### Two-Stage Training (Removed)
-- Originally implemented but removed for simplicity
-- Full model fine-tuning with all layers trainable
 
 ### Data Pipeline
 1. **Resize:** 256×256
@@ -254,45 +241,65 @@ HW1/
 - Clear GPU cache: `torch.cuda.empty_cache()`
 - Use smaller model (ecaresnet50d instead of resnext101)
 
-### Training Diverges
-- Reduce LEARNING_RATE (try 0.004)
-- Increase WEIGHT_DECAY (try 5e-4)
-- Reduce augmentation strength
+### Learning Rate Scheduler Optimization
+**Issue:** Initially used cosine annealing scheduler, but observed poor loss reduction in later training epochs.
 
-### Validation Accuracy Plateaus
-- Increase NUM_EPOCHS (try 200)
-- Check TensorBoard for learning rate schedule
-- Verify data augmentation is applied (RandomCrop should work, not CenterCrop)
+**Solution:** Switched to **MultiStepLR** scheduler with milestones at [30, 120] epochs. This multi-stage decay approach provided more stable convergence and better loss decrease in the final training phase.
 
-### Poor Test Performance Despite High Val Accuracy
-- Indicates overfitting
-- Reduce CutMix probability (try 0.3)
-- Increase weight decay
-- Use ReduceLROnPlateau scheduler
+### Validation Accuracy Plateau
+**Issue:** Validation accuracy plateaued around 92% and couldn't improve further.
+
+**Root Cause Analysis:** Dataset analysis revealed that the challenging classes consist primarily of:
+- **Fine-grained bird species:** Subtle differences in feather patterns, coloration, and size
+- **Plant details:** Minute variations in leaf patterns, flower structures, and plant morphology
+
+These features require higher discriminative capacity to distinguish effectively.
+
+**Attempted Solutions:**
+1. **Attention-based models:** Tested squeeze-and-excitation networks and channel attention mechanisms
+   - Result: Minimal improvement (~0.5% accuracy gain)
+   
+2. **iNaturalist pre-training:** Experimented with models pre-trained on iNaturalist dataset (domain-specific)
+   - Result: Limited effectiveness on this specific dataset
+
+**Final Solution:** Switched to **larger capacity models** (ECA-ResNet50d, ResNeXt-101) with more parameters to better capture fine-grained visual features. The increased model capacity enabled better learning of subtle discriminative patterns.
+
+**Challenging Classes (Analysis):**
+- Class 11 (Birds): ~50% accuracy - Fine feather distinctions
+- Class 20 & 26 (Plants): ~40% accuracy - Highly similar leaf structures
+- Class 44, 58, 72 (Mixed): ~35-45% accuracy - Subtle morphological differences
+
 
 ---
 
 ## Citation & References
 
-- **ECA-ResNet:** Efficient Channel Attention (Wang et al., 2020)
-- **RandAugment:** RandAugment: Practical automated data augmentation (Cubuk et al., 2019)
-- **CutMix:** CutMix: Regularization Strategy to Train Strong Classifiers (Yun et al., 2019)
-- **PyTorch:** https://pytorch.org/
-- **timm:** https://github.com/rwightman/pytorch-image-models
+### Model Architectures
+- **ECA-ResNet:** ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks (Wang et al., 2020) - https://arxiv.org/abs/1910.03151
+- **Squeeze-and-Excitation Networks:** Hu et al., 2018 - https://arxiv.org/abs/1709.01507
+- **CBAM: Convolutional Block Attention Module:** Woo et al., 2018 - https://arxiv.org/abs/1807.06521
+- **BAM: Bottleneck Attention Module:** Park et al., 2018 - https://arxiv.org/abs/1807.06674
+- **ResNet:** Deep Residual Learning for Image Recognition (He et al., 2015)
+- **ResNeXt:** Aggregated Residual Transformations for Deep Neural Networks (Xie et al., 2017)
+
+### Data Augmentation
+- **RandAugment:** RandAugment: Practical automated data augmentation with a reduced search space (Cubuk et al., 2019)
+- **CutMix:** CutMix: Regularization Strategy to Train Strong Classifiers (Yun et al., 2019) - https://arxiv.org/abs/1905.04412
+- **AutoAugment:** AutoAugment: Learning Augmentation Policies from Data (Cubuk et al., 2019)
+- **Mixup:** mixup: Beyond Empirical Risk Minimization (Zhang et al., 2017)
+
+### Fine-grained Image Recognition
+- **Fine-Grained Visual Categorization of Aircraft:** Fine-Grained Visual Categorization of Aircraft (Maji et al., 2013)
+- **The iNaturalist Species Classification and Detection Dataset:** Horn et al., 2018
+- **Attention-based Deep Multiple Instance Learning:** Ilse et al., 2018
+
+### Related Techniques
+- **Label Smoothing:** When Does Label Smoothing Help? (Müller et al., 2019)
+- **Warmup Strategies:** A Closer Look at Deep Learning Heuristics: Learning rate restart Warmup and Decay (Gotmare et al., 2018)
 
 ---
 
-## Version History
-
-| Version | Date | Changes |
-|---------|------|---------|
-| 1.0 | 2026-03-31 | Initial release with MultiStepLR and enhanced augmentation |
-| 0.9 | 2026-03-30 | Removed two-stage training and class weighting |
-| 0.8 | 2026-03-29 | Added TensorBoard monitoring |
-| 0.7 | 2026-03-28 | Initial configuration and error analysis |
-
----
 
 **Last Updated:** 2026-03-31  
-**Author:** [Your Name]  
-**Student ID:** 123456789
+**Author:** Zheng Wu Qian
+**Student ID:** 112550200
