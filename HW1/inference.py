@@ -1,12 +1,22 @@
-import os
-import csv
-import torch
+"""Inference script for generating predictions on test dataset.
+
+This module loads a trained model and generates predictions on the test set,
+saving results to a CSV file in the standard Kaggle format.
+
+Typical usage example:
+  python inference.py --model ecaresnet50d --checkpoint models/best_model.pth
+"""
+
 import argparse
+import csv
+import os
 from pathlib import Path
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, Dataset
-from PIL import Image
+
+import torch
 import torch.nn as nn
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, models, transforms
 
 try:
     import timm
@@ -14,10 +24,24 @@ try:
 except ImportError:
     TIMM_AVAILABLE = False
 
-from config import *
+from config import (
+    BATCH_SIZE,
+    DEVICE,
+    IMAGE_SIZE,
+    MODEL_CHECKPOINT,
+    NUM_CLASSES,
+    NUM_WORKERS,
+    TEST_DIR,
+    WEIGHTS_NAME,
+)
 
 
 class NumericSortedImageFolder(datasets.ImageFolder):
+    """ImageFolder with numeric directory sorting.
+
+    Extends ImageFolder to sort directories numerically rather than
+    lexicographically, useful for class folders named 0-99.
+    """
 
     def find_classes(self, directory):
         classes = sorted(
@@ -29,6 +53,13 @@ class NumericSortedImageFolder(datasets.ImageFolder):
 
 
 class SimpleImageDataset(Dataset):
+    """Simple dataset for loading images without labels.
+
+    Attributes:
+        image_dir: Directory path containing images.
+        transform: Optional image transformation pipeline.
+        image_paths: List of paths to image files.
+    """
 
     def __init__(self, image_dir: str, transform=None):
         self.image_dir = image_dir
@@ -51,8 +82,29 @@ class SimpleImageDataset(Dataset):
         return image, Path(img_path).stem
 
 
-def load_model(model_name: str = "ecaresnet50d", num_classes: int = 100,
-               checkpoint_path: str = None, device: str = "cuda"):
+def load_model(
+    model_name: str = "ecaresnet50d",
+    num_classes: int = 100,
+    checkpoint_path: str | None = None,
+    device: str = "cuda"
+) -> nn.Module:
+    """Load and initialize a classification model.
+
+    Args:
+        model_name: Name of the model architecture to load.
+        num_classes: Number of output classes.
+        checkpoint_path: Path to model checkpoint file. If None, uses
+            MODEL_CHECKPOINT from config.
+        device: Device to place model on ('cuda' or 'cpu').
+
+    Returns:
+        Loaded model in evaluation mode.
+
+    Raises:
+        ImportError: If timm is required but not installed.
+        FileNotFoundError: If checkpoint file is not found.
+        ValueError: If model_name is not supported.
+    """
 
     if model_name in ['ecaresnet50d', 'gcresnet50t', 'resnet101']:
         if model_name in ['ecaresnet50d', 'gcresnet50t']:
@@ -112,7 +164,12 @@ def load_model(model_name: str = "ecaresnet50d", num_classes: int = 100,
     return model
 
 
-def get_test_transform():
+def get_test_transform() -> transforms.Compose:
+    """Get image transformations for test dataset.
+
+    Returns:
+        Composed transformation pipeline for test images.
+    """
     return transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(IMAGE_SIZE),
@@ -123,10 +180,22 @@ def get_test_transform():
 
 
 def generate_predictions(
-        model,
-        test_loader,
-        device,
-        output_path: str = "prediction.csv"):
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: str,
+    output_path: str = "prediction.csv"
+) -> str:
+    """Generate predictions on test set and save to CSV.
+
+    Args:
+        model: Trained model in evaluation mode.
+        test_loader: DataLoader for test dataset.
+        device: Device to run model on.
+        output_path: Path to save prediction CSV.
+
+    Returns:
+        Path to the saved prediction file.
+    """
 
     predictions = []
     image_ids = []

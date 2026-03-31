@@ -33,6 +33,11 @@ from utils import (
 
 
 class NumericSortedImageFolder(datasets.ImageFolder):
+    """ImageFolder with numeric directory sorting.
+
+    Extends ImageFolder to sort directories numerically rather than
+    lexicographically, useful for class folders named 0-99.
+    """
 
     def find_classes(self, directory):
         classes = sorted(
@@ -44,6 +49,13 @@ class NumericSortedImageFolder(datasets.ImageFolder):
 
 
 class SimpleImageDataset(Dataset):
+    """Simple dataset for loading images without labels.
+
+    Attributes:
+        image_dir: Directory path containing images.
+        transform: Optional image transformation pipeline.
+        image_paths: List of paths to image files.
+    """
 
     def __init__(self, image_dir: str, transform=None):
         self.image_dir = image_dir
@@ -67,6 +79,16 @@ class SimpleImageDataset(Dataset):
 
 
 class ResNetClassifier:
+    """ResNet-based image classifier wrapper.
+
+    Supports multiple model architectures including ResNet50, ResNeXt-101,
+    ECA-ResNet50d, and GCResNet50t with optional pretrained weights.
+
+    Attributes:
+        device: GPU/CPU device for model.
+        model_name: Name of the model architecture.
+        num_classes: Number of output classes.
+    """
 
     def __init__(
             self,

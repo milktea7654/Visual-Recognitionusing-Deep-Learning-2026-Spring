@@ -1,14 +1,25 @@
-import os
+"""Utility functions for training and data loading.
+
+Provides helper functions for:
+  - Logging setup
+  - Model parameter counting
+  - Checkpoint saving/loading
+  - Data augmentation and transforms
+  - Metrics computation
+"""
+
 import logging
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from torchvision.transforms import v2
-import numpy as np
-from pathlib import Path
 from PIL import Image
-from typing import Tuple, Optional, List
+from torchvision.transforms import v2
 
 
 def setup_logging(log_dir: str = "./logs") -> logging.Logger:
