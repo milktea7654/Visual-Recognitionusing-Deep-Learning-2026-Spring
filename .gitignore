@@ -20,7 +20,6 @@ build/
 
 # Data and Models
 **/checkpoints/
-**/models/*
 **/*.pth           # PyTorch model files
 **/logs/
 **/runs/
