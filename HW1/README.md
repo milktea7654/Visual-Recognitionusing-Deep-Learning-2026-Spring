@@ -104,16 +104,6 @@ python inference.py --model resnext101_32x8d
 # Output: prediction.csv with test predictions
 ```
 
-### Analysis
-
-#### Analyze Validation Errors
-```bash
-python analyze_predictions.py
-```
-Generates:
-- `validation_errors.csv` - Misclassified samples and predictions
-- `class_accuracy.csv` - Per-class accuracy metrics
-
 ### Monitor Training with TensorBoard
 
 ```bash
