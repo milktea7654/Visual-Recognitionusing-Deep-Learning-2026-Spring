@@ -24,6 +24,8 @@ build/
 **/*.pth           # PyTorch model files
 **/logs/
 **/runs/
+**/pretrained_cache/
+**/output/
 
 # Large files
 *.zip
@@ -33,7 +35,7 @@ build/
 **/prediction*.csv
 **/validation_errors.csv
 **/class_accuracy.csv
-
+**/*.json
 # OS
 .DS_Store
 Thumbs.db
