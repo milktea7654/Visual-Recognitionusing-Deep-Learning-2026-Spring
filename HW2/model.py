@@ -776,16 +776,17 @@ def load_pretrained_deformable_detr(model, ckpt_path, verbose=True):
         model_sd[our_key] = p_val
         loaded_keys.append(our_key)
 
-    # Special: level_embed partial load (4→3 rows)
+    # Special: level_embed partial load (4→3 rows, truncate d_model if needed)
     p_le = pretrained.get("model.level_embed")
     our_le_key = "transformer.level_embed"
     if p_le is not None and our_le_key in model_sd:
-        n = model_sd[our_le_key].shape[0]
-        model_sd[our_le_key] = p_le[:n]
-        loaded_keys.append(our_le_key + " (partial 4→3)")
+        tgt_shape = model_sd[our_le_key].shape
+        n = tgt_shape[0]
+        d = tgt_shape[1]
+        model_sd[our_le_key] = p_le[:n, :d]
+        loaded_keys.append(our_le_key + f" (partial)")
 
-    # Special: partial load of deformable attention params (4 levels → 3 levels)
-    # These control WHERE deformable attention samples — critical for bbox quality
+    # Special: partial load of deformable attention params (4 levels → 3, d_model adapt)
     n_heads = 8
     n_points = 4
     src_levels = 4   # pretrained
@@ -806,37 +807,41 @@ def load_pretrained_deformable_detr(model, ckpt_path, verbose=True):
         ))
 
     for p_prefix, our_prefix in partial_pairs:
-        # sampling_offsets: [n_heads * n_levels * n_points * 2, d_model]
+        # sampling_offsets weight: [n_heads * n_levels * n_points * 2, d_model]
         p_w = pretrained.get(f"{p_prefix}.sampling_offsets.weight")
         our_k = f"{our_prefix}.sampling_offsets.weight"
         if p_w is not None and our_k in model_sd:
-            d_model = p_w.shape[1]
-            w = p_w.reshape(n_heads, src_levels, n_points, 2, d_model)
-            model_sd[our_k] = w[:, :tgt_levels].reshape(-1, d_model)
-            loaded_keys.append(our_k + " (partial 4→3)")
+            src_d = p_w.shape[1]
+            tgt_d = model_sd[our_k].shape[1]
+            w = p_w.reshape(n_heads, src_levels, n_points, 2, src_d)
+            w = w[:, :tgt_levels, :, :, :tgt_d].reshape(-1, tgt_d)
+            model_sd[our_k] = w
+            loaded_keys.append(our_k + " (partial)")
 
         p_b = pretrained.get(f"{p_prefix}.sampling_offsets.bias")
         our_k = f"{our_prefix}.sampling_offsets.bias"
         if p_b is not None and our_k in model_sd:
             b = p_b.reshape(n_heads, src_levels, n_points, 2)
             model_sd[our_k] = b[:, :tgt_levels].reshape(-1)
-            loaded_keys.append(our_k + " (partial 4→3)")
+            loaded_keys.append(our_k + " (partial)")
 
-        # attention_weights: [n_heads * n_levels * n_points, d_model]
+        # attention_weights weight: [n_heads * n_levels * n_points, d_model]
         p_w = pretrained.get(f"{p_prefix}.attention_weights.weight")
         our_k = f"{our_prefix}.attention_weights.weight"
         if p_w is not None and our_k in model_sd:
-            d_model = p_w.shape[1]
-            w = p_w.reshape(n_heads, src_levels, n_points, d_model)
-            model_sd[our_k] = w[:, :tgt_levels].reshape(-1, d_model)
-            loaded_keys.append(our_k + " (partial 4→3)")
+            src_d = p_w.shape[1]
+            tgt_d = model_sd[our_k].shape[1]
+            w = p_w.reshape(n_heads, src_levels, n_points, src_d)
+            w = w[:, :tgt_levels, :, :tgt_d].reshape(-1, tgt_d)
+            model_sd[our_k] = w
+            loaded_keys.append(our_k + " (partial)")
 
         p_b = pretrained.get(f"{p_prefix}.attention_weights.bias")
         our_k = f"{our_prefix}.attention_weights.bias"
         if p_b is not None and our_k in model_sd:
             b = p_b.reshape(n_heads, src_levels, n_points)
             model_sd[our_k] = b[:, :tgt_levels].reshape(-1)
-            loaded_keys.append(our_k + " (partial 4→3)")
+            loaded_keys.append(our_k + " (partial)")
 
     # query_embed: skipped (random init — COCO spatial priors hurt small digits)
 
