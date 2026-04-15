@@ -19,7 +19,7 @@ from dataset import (
     make_val_transforms,
     collate_fn,
 )
-from model import DETR, load_pretrained_deformable_detr
+from model import DETR
 
 
 # ---------------------------------------------------------------------------
@@ -402,10 +402,6 @@ def train():
         aux_loss=config.AUX_LOSS,
         iterative_refine=config.ITERATIVE_REFINE,
     ).to(device)
-
-    # ---- Optional: load COCO-pretrained Deformable DETR weights --------
-    if config.PRETRAINED_DETR and config.RESUME is None:
-        load_pretrained_deformable_detr(model, config.PRETRAINED_DETR)
 
     # ---- Optional: freeze early backbone layers -----------------------
     if config.FREEZE_BACKBONE_EARLY:

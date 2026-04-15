@@ -29,9 +29,6 @@ DIM_FEEDFORWARD = 512   # 4× HIDDEN_DIM
 DROPOUT = 0.2
 PRETRAINED_BACKBONE = True
 
-# Pretrained Deformable DETR weights — disabled (HW requires training from scratch)
-PRETRAINED_DETR = None
-
 # Deformable attention specific
 N_FEATURE_LEVELS = 3    # C3 / C4 / C5 from ResNet-50
 N_POINTS = 4            # sampling points per attention head per level
