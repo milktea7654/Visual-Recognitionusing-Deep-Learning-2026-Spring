@@ -45,6 +45,110 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 
+@torch.no_grad()
+def prepare_for_cdn(targets, dn_number, label_noise_ratio, box_noise_scale,
+                    num_queries, num_classes, device):
+    """Prepare Contrastive De-Noising (CDN) training queries (DINO).
+
+    Creates noised copies of GT labels/boxes as extra decoder queries.
+    Even-indexed groups are positive (reconstruct GT), odd-indexed are negative
+    (flipped labels → should predict low confidence).
+
+    Args:
+        targets: list[dict] with 'labels' [N_i] (1-indexed) and 'boxes' [N_i, 4]
+        dn_number: controls number of denoising groups
+        label_noise_ratio: probability of flipping a GT label
+        box_noise_scale: noise magnitude relative to box w/h
+        num_queries: number of normal detection queries
+        num_classes: number of object classes
+        device: torch device
+
+    Returns:
+        dn_label_ids:  [B, pad_size] int64 (0-indexed class IDs)
+        dn_bbox:       [B, pad_size, 4] float (noised cxcywh in [0, 1])
+        attn_mask:     [pad_size + Q, pad_size + Q] bool (True = blocked)
+        dn_meta:       dict with 'pad_size', 'is_valid', 'gt_indices', 'is_negative'
+    """
+    batch_size = len(targets)
+    known_num = [len(t['labels']) for t in targets]
+    max_gt = max(known_num) if known_num else 0
+
+    if max_gt == 0 or dn_number <= 0:
+        return None, None, None, {}
+
+    # Number of groups: half positive, half negative
+    num_groups = max(dn_number // max_gt, 1)
+    if num_groups % 2 == 1:
+        num_groups += 1
+    num_groups = max(num_groups, 2)
+
+    single_pad = max_gt
+    pad_size = num_groups * single_pad
+
+    # Build repeated GT labels and boxes
+    input_label = torch.zeros(batch_size, pad_size, dtype=torch.long, device=device)
+    input_bbox = torch.zeros(batch_size, pad_size, 4, device=device)
+    is_valid = torch.zeros(batch_size, pad_size, dtype=torch.bool, device=device)
+    gt_indices = torch.zeros(batch_size, pad_size, dtype=torch.long, device=device)
+
+    for b in range(batch_size):
+        n = known_num[b]
+        if n == 0:
+            continue
+        for g in range(num_groups):
+            s = g * single_pad
+            input_label[b, s:s + n] = targets[b]['labels']       # 1-indexed
+            input_bbox[b, s:s + n] = targets[b]['boxes']
+            is_valid[b, s:s + n] = True
+            gt_indices[b, s:s + n] = torch.arange(n, device=device)
+
+    # Label noise: flip with probability label_noise_ratio
+    noised_label = input_label.clone()
+    if label_noise_ratio > 0:
+        flip = torch.rand(batch_size, pad_size, device=device) < label_noise_ratio
+        flip = flip & is_valid
+        rand_label = torch.randint(1, num_classes + 1, (batch_size, pad_size), device=device)
+        noised_label[flip] = rand_label[flip]
+
+    # Convert to 0-indexed for embedding; clamp invalid to 0
+    dn_label_ids = (noised_label - 1).clamp(0, num_classes - 1)
+
+    # Box noise: add noise scaled by box w/h
+    noised_bbox = input_bbox.clone()
+    if box_noise_scale > 0:
+        box_wh = input_bbox[..., 2:].clamp(min=1e-4)  # [B, pad, 2]
+        noise = (torch.rand_like(noised_bbox) * 2 - 1) * box_noise_scale
+        noise[..., :2] *= box_wh   # cx, cy noise proportional to w, h
+        noise[..., 2:] *= box_wh   # w, h noise proportional to w, h
+        noised_bbox = (noised_bbox + noise).clamp(0, 1)
+    noised_bbox[~is_valid] = 0
+
+    # Attention mask: block cross-group and DN↔detection attention
+    attn_mask = torch.ones(pad_size + num_queries, pad_size + num_queries,
+                           dtype=torch.bool, device=device)
+    # Detection queries attend to each other
+    attn_mask[pad_size:, pad_size:] = False
+    # Within each group: attend freely
+    for g in range(num_groups):
+        s = g * single_pad
+        e = s + single_pad
+        attn_mask[s:e, s:e] = False
+
+    # Negative groups are odd-indexed (1, 3, 5, ...)
+    group_per_pos = torch.arange(pad_size, device=device) // single_pad
+    is_negative = (group_per_pos % 2 == 1).unsqueeze(0).expand(batch_size, -1)
+
+    dn_meta = {
+        'pad_size': pad_size,
+        'single_pad': single_pad,
+        'num_groups': num_groups,
+        'is_valid': is_valid,        # [B, pad_size]
+        'gt_indices': gt_indices,    # [B, pad_size]
+        'is_negative': is_negative,  # [B, pad_size]
+    }
+    return dn_label_ids, noised_bbox, attn_mask, dn_meta
+
+
 class PositionEmbeddingSine(nn.Module):
     """2-D sine/cosine positional encoding (follows original DETR paper)."""
 
@@ -89,13 +193,12 @@ class PositionEmbeddingSine(nn.Module):
 # ---------------------------------------------------------------------------
 
 class BackboneResNet50(nn.Module):
-    """ResNet-50 backbone returning multi-scale features (C2, C3, C4).
+    """ResNet-50 backbone returning multi-scale features (C3, C4, C5).
 
-    Uses lower-stride features for small object (digit) detection:
-    - C2 (stride 4, 256 ch): preserves fine digit edges
-    - C3 (stride 8, 512 ch): main feature level
-    - C4 (stride 16, 1024 ch): context
-    Drops C5 (stride 32) which gives <1.5px per digit — useless.
+    Standard Deformable DETR feature levels:
+    - C3 (stride 8,  512 ch):  fine detail
+    - C4 (stride 16, 1024 ch): main feature level
+    - C5 (stride 32, 2048 ch): context / large receptive field
     """
 
     def __init__(self, pretrained=True, train_backbone=True):
@@ -106,11 +209,12 @@ class BackboneResNet50(nn.Module):
         self.stem = nn.Sequential(
             net.conv1, net.bn1, net.relu, net.maxpool
         )
-        self.layer1 = net.layer1   # stride 4,  256 ch  → C2
+        self.layer1 = net.layer1   # stride 4,  256 ch  → C2 (not returned)
         self.layer2 = net.layer2   # stride 8,  512 ch  → C3
         self.layer3 = net.layer3   # stride 16, 1024 ch → C4
+        self.layer4 = net.layer4   # stride 32, 2048 ch → C5
 
-        self.num_channels = [256, 512, 1024]
+        self.num_channels = [512, 1024, 2048]
         self.train_backbone = train_backbone
 
         if not train_backbone:
@@ -122,7 +226,8 @@ class BackboneResNet50(nn.Module):
         c2 = self.layer1(x)
         c3 = self.layer2(c2)
         c4 = self.layer3(c3)
-        return [c2, c3, c4]
+        c5 = self.layer4(c4)
+        return [c3, c4, c5]
 
     def train(self, mode=True):
         """Keep BatchNorm frozen to avoid stats noise at small batch sizes."""
@@ -353,10 +458,11 @@ class DeformableTransformerDecoderLayer(nn.Module):
     def forward(
         self, tgt, query_pos, reference_points,
         src, src_spatial_shapes, src_padding_mask=None,
+        self_attn_mask=None,
     ):
         # Self-attention among object queries
         q = k = tgt + query_pos
-        tgt2, _ = self.self_attn(q, k, tgt)
+        tgt2, _ = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         # Deformable cross-attention
@@ -389,11 +495,16 @@ class DeformableTransformer(nn.Module):
         n_levels=3,
         n_points=4,
         use_checkpoint=False,
+        two_stage=False,
+        two_stage_num_proposals=300,
+        num_classes=10,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_levels = n_levels
         self.use_checkpoint = use_checkpoint
+        self.two_stage = two_stage
+        self.two_stage_num_proposals = two_stage_num_proposals
 
         enc_layer = DeformableTransformerEncoderLayer(
             d_model, dim_feedforward, dropout, n_levels, nhead, n_points
@@ -412,15 +523,47 @@ class DeformableTransformer(nn.Module):
         # Learnable level embedding added to each scale
         self.level_embed = nn.Parameter(torch.Tensor(n_levels, d_model))
 
-        # Project query embedding → reference point (x, y)
-        self.reference_points_linear = nn.Linear(d_model, 2)
+        if two_stage:
+            # Two-stage: encoder output → proposal class + bbox
+            self.enc_output = nn.Linear(d_model, d_model)
+            self.enc_output_norm = nn.LayerNorm(d_model)
+            self.enc_cls_head = nn.Linear(d_model, num_classes)
+            self.enc_bbox_head = MLP(d_model, d_model, 4, 3)
+            # Project selected encoder features → query_pos + query_tgt
+            self.pos_trans = nn.Linear(d_model * 2, d_model * 2)
+            self.pos_trans_norm = nn.LayerNorm(d_model * 2)
+        else:
+            # Project query embedding → reference point (x, y)
+            self.reference_points_linear = nn.Linear(d_model, 2)
 
         self._reset_parameters()
 
     def _reset_parameters(self):
         nn.init.normal_(self.level_embed)
-        nn.init.xavier_uniform_(self.reference_points_linear.weight)
-        nn.init.constant_(self.reference_points_linear.bias, 0.0)
+        if self.two_stage:
+            nn.init.xavier_uniform_(self.enc_output.weight)
+            nn.init.xavier_uniform_(self.pos_trans.weight)
+        else:
+            nn.init.xavier_uniform_(self.reference_points_linear.weight)
+            nn.init.constant_(self.reference_points_linear.bias, 0.0)
+
+    def _get_proposal_pos_embed(self, proposals):
+        """Generate sinusoidal positional embedding from proposal boxes [B, N, 4]."""
+        num_pos_feats = self.d_model // 2
+        temperature = 10000
+        scale = 2 * math.pi
+
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=proposals.device)
+        dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+
+        # proposals: [B, N, 4] (cx, cy, w, h) in [0, 1]
+        proposals = proposals * scale
+        # [B, N, 4, num_pos_feats]
+        pos = proposals[:, :, :, None] / dim_t
+        # sin/cos interleaved → [B, N, 4*num_pos_feats] = [B, N, 2*d_model]
+        pos = torch.stack([pos[:, :, :, 0::2].sin(), pos[:, :, :, 1::2].cos()], dim=4)
+        pos = pos.flatten(2)
+        return pos
 
     @staticmethod
     def _get_encoder_reference_points(spatial_shapes, device):
@@ -442,13 +585,35 @@ class DeformableTransformer(nn.Module):
         )
         return reference_points
 
-    def forward(self, srcs, masks, pos_embeds, query_embed):
+    def _get_reference_pos_embed(self, ref_points):
+        """Convert [B, N, 2] reference points → [B, N, C] sinusoidal positional embedding."""
+        num_pos_feats = self.d_model // 2   # C/2 for x, C/2 for y
+        temperature = 10000
+        scale = 2 * math.pi
+
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=ref_points.device)
+        dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+
+        ref = ref_points * scale    # [B, N, 2]
+        pos_x = ref[..., 0:1] / dim_t  # [B, N, feats]
+        pos_y = ref[..., 1:2] / dim_t
+        pos_x = torch.stack([pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()], dim=-1).flatten(-2)
+        pos_y = torch.stack([pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()], dim=-1).flatten(-2)
+        return torch.cat([pos_y, pos_x], dim=-1)  # [B, N, C]
+
+    def forward(self, srcs, masks, pos_embeds, query_embed,
+                dn_label_embed=None, dn_bbox=None, dn_attn_mask=None,
+                tgt_embed_override=None):
         """
         Args:
             srcs:       list of [B, C, Hi, Wi] projected feature maps
             masks:      list of [B, Hi, Wi] boolean masks
             pos_embeds: list of [B, C, Hi, Wi] positional encodings
             query_embed: [Q, 2*C] (split into query_pos + query_tgt)
+            dn_label_embed: [B, pad_size, C] denoising label embeddings (optional)
+            dn_bbox:        [B, pad_size, 4] noised boxes for DN queries (optional)
+            dn_attn_mask:   [pad+Q, pad+Q] bool attention mask (optional)
+            tgt_embed_override: [B, Q, C] learnable target embedding (optional)
         Returns:
             hs: [B, Q, C] decoder output
         """
@@ -494,14 +659,82 @@ class DeformableTransformer(nn.Module):
                 )
 
         # --- decoder -----------------------------------------------------
-        query_pos, query_tgt = query_embed.split(C, dim=1)
-        query_pos = query_pos.unsqueeze(0).expand(B, -1, -1)
-        query_tgt = query_tgt.unsqueeze(0).expand(B, -1, -1)
+        enc_outputs_dict = None
+        if self.two_stage:
+            # Score each encoder token and select top-K proposals
+            enc_out = self.enc_output_norm(self.enc_output(memory))  # [B, Σ, C]
+            enc_cls_logits = self.enc_cls_head(enc_out)  # [B, Σ, num_classes]
+            enc_bbox_raw = self.enc_bbox_head(enc_out)   # [B, Σ, 4]
 
-        # Reference points from query_pos → sigmoid → [0, 1]
-        dec_ref = self.reference_points_linear(query_pos).sigmoid()
-        # → [B, Q, n_levels, 2]
-        dec_ref = dec_ref[:, :, None, :].repeat(1, 1, self.n_levels, 1)
+            # Build reference point per encoder token from grid centers
+            enc_ref_xy = self._get_encoder_reference_points(
+                spatial_shapes, memory.device
+            )[:, :, 0, :]  # [1, Σ, 2]
+            enc_ref_xy = enc_ref_xy.expand(B, -1, -1)  # [B, Σ, 2]
+            # Bbox proposal: offset + reference → sigmoid
+            enc_proposals = torch.cat([
+                (_inverse_sigmoid(enc_ref_xy) + enc_bbox_raw[..., :2]).sigmoid(),
+                enc_bbox_raw[..., 2:].sigmoid(),
+            ], dim=-1)  # [B, Σ, 4] cxcywh in [0,1]
+
+            # Select top-K by max class score (across classes)
+            topk_score = enc_cls_logits.max(-1)[0]  # [B, Σ]
+            # Mask out padding positions
+            topk_score = topk_score.masked_fill(mask_flatten, float('-inf'))
+            topk_k = min(self.two_stage_num_proposals, topk_score.shape[1])
+            topk_indices = topk_score.topk(topk_k, dim=1)[1]  # [B, K]
+
+            # Gather selected proposals and features
+            topk_proposals = torch.gather(
+                enc_proposals, 1,
+                topk_indices.unsqueeze(-1).expand(-1, -1, 4)
+            )  # [B, K, 4]
+            topk_features = torch.gather(
+                enc_out, 1,
+                topk_indices.unsqueeze(-1).expand(-1, -1, C)
+            )  # [B, K, C]
+
+            # Reference points from proposals (detach to stop gradient)
+            dec_ref = topk_proposals[..., :2].detach()  # [B, K, 2]
+            dec_ref = dec_ref[:, :, None, :].repeat(1, 1, self.n_levels, 1)
+
+            # Generate query_pos + query_tgt from proposals
+            pos_embed = self._get_proposal_pos_embed(topk_proposals.detach())
+            query_both = self.pos_trans_norm(self.pos_trans(pos_embed))
+            query_pos, query_tgt = query_both.split(C, dim=-1)
+
+            # embed_init_tgt: use learnable content instead of encoder-derived
+            if tgt_embed_override is not None:
+                query_tgt = tgt_embed_override
+
+            enc_outputs_dict = {
+                "enc_cls_logits": enc_cls_logits,
+                "enc_bbox_proposals": enc_proposals,
+                "topk_indices": topk_indices,
+            }
+        else:
+            query_pos, query_tgt = query_embed.split(C, dim=1)
+            query_pos = query_pos.unsqueeze(0).expand(B, -1, -1)
+            query_tgt = query_tgt.unsqueeze(0).expand(B, -1, -1)
+
+            # embed_init_tgt: use learnable content instead of query_embed split
+            if tgt_embed_override is not None:
+                query_tgt = tgt_embed_override
+
+            # Reference points from query_pos → sigmoid → [0, 1]
+            dec_ref = self.reference_points_linear(query_pos).sigmoid()
+            # → [B, Q, n_levels, 2]
+            dec_ref = dec_ref[:, :, None, :].repeat(1, 1, self.n_levels, 1)
+
+        # --- prepend denoising queries (CDN) ----------------------------
+        if dn_label_embed is not None:
+            dn_ref = dn_bbox[..., :2]  # box centers [B, pad, 2]
+            dn_query_pos = self._get_reference_pos_embed(dn_ref)
+            dn_ref_expanded = dn_ref[:, :, None, :].repeat(1, 1, self.n_levels, 1)
+
+            query_tgt = torch.cat([dn_label_embed, query_tgt], dim=1)
+            query_pos = torch.cat([dn_query_pos, query_pos], dim=1)
+            dec_ref = torch.cat([dn_ref_expanded, dec_ref], dim=1)
 
         hs = query_tgt
         intermediate = []
@@ -510,6 +743,7 @@ class DeformableTransformer(nn.Module):
             hs = layer(
                 hs, query_pos, dec_ref,
                 memory, spatial_shapes, mask_flatten,
+                self_attn_mask=dn_attn_mask,
             )
             intermediate.append(hs)
             intermediate_ref.append(dec_ref[:, :, 0, :])  # [B, Q, 2]
@@ -525,7 +759,7 @@ class DeformableTransformer(nn.Module):
         hs_stack = torch.stack(intermediate)
         ref_stack = torch.stack(intermediate_ref)  # [n_decoder_layers, B, Q, 2]
 
-        return hs_stack, ref_stack
+        return hs_stack, ref_stack, enc_outputs_dict
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +794,13 @@ class DETR(nn.Module):
         use_checkpoint=False,
         aux_loss=True,
         iterative_refine=True,
+        two_stage=False,
+        two_stage_num_proposals=300,
+        use_dn=False,
+        dn_number=100,
+        dn_label_noise_ratio=0.5,
+        dn_box_noise_scale=1.0,
+        embed_init_tgt=False,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -568,6 +809,12 @@ class DETR(nn.Module):
         self.n_levels = n_levels
         self.aux_loss = aux_loss
         self.iterative_refine = iterative_refine
+        self.two_stage = two_stage
+        self.use_dn = use_dn
+        self.dn_number = dn_number
+        self.dn_label_noise_ratio = dn_label_noise_ratio
+        self.dn_box_noise_scale = dn_box_noise_scale
+        self.embed_init_tgt = embed_init_tgt
 
         # --- backbone -------------------------------------------------
         self.backbone = BackboneResNet50(pretrained=pretrained_backbone)
@@ -580,6 +827,15 @@ class DETR(nn.Module):
             )
             for ch in self.backbone.num_channels
         ])
+        # Extra conv levels: stride-64 from C5 (standard Deformable DETR)
+        num_backbone_levels = len(self.backbone.num_channels)
+        if n_levels > num_backbone_levels:
+            for _ in range(n_levels - num_backbone_levels):
+                in_ch = self.backbone.num_channels[-1] if len(self.input_proj) == num_backbone_levels else hidden_dim
+                self.input_proj.append(nn.Sequential(
+                    nn.Conv2d(in_ch, hidden_dim, kernel_size=3, stride=2, padding=1),
+                    nn.GroupNorm(32, hidden_dim),
+                ))
 
         # --- positional encoding --------------------------------------
         self.pos_enc = PositionEmbeddingSine(hidden_dim // 2)
@@ -595,10 +851,25 @@ class DETR(nn.Module):
             n_levels=n_levels,
             n_points=n_points,
             use_checkpoint=use_checkpoint,
+            two_stage=two_stage,
+            two_stage_num_proposals=two_stage_num_proposals,
+            num_classes=num_classes,
         )
 
-        # query_embed stores both positional part and content part
-        self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
+        # query_embed: only needed for one-stage
+        if not two_stage:
+            self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)
+        else:
+            self.query_embed = None
+
+        # --- denoising training (CDN) ---------------------------------
+        if use_dn:
+            self.label_enc = nn.Embedding(num_classes, hidden_dim)
+
+        # --- learnable target embedding (DINO embed_init_tgt) ---------
+        if embed_init_tgt:
+            self.tgt_embed = nn.Embedding(num_queries, hidden_dim)
+            nn.init.normal_(self.tgt_embed.weight)
 
         # --- output heads ---------------------------------------------
         # Sigmoid classification — num_classes only (no background slot)
@@ -635,16 +906,19 @@ class DETR(nn.Module):
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0.0)
 
-    def forward(self, samples, masks):
+    def forward(self, samples, masks, targets=None):
         """
         Args:
             samples: [B, 3, H, W] padded batch of images
             masks:   [B, H, W] bool (True = padding pixel)
+            targets: list[dict] with 'labels' and 'boxes' (training only, for DN)
         Returns:
             dict with:
                 'pred_logits': [B, num_queries, num_classes]  (raw logits)
                 'pred_boxes':  [B, num_queries, 4]            (sigmoid cxcywh)
                 'aux_outputs': list of dicts (one per intermediate decoder layer)
+                'dn_outputs':  dict (training only, for DN loss)
+                'dn_meta':     dict (training only, for DN loss)
         """
         # 1. Multi-scale backbone features
         features = self.backbone(samples)   # [C3, C4, C5]
@@ -665,12 +939,65 @@ class DETR(nn.Module):
             ms_masks.append(mask)
             pos_embeds.append(pos)
 
-        # 2. Deformable transformer
-        hs_stack, ref_stack = self.transformer(
-            srcs, ms_masks, pos_embeds, self.query_embed.weight
-        )   # hs_stack: [n_dec, B, Q, C], ref_stack: [n_dec, B, Q, 2]
+        # Extra feature levels from additional conv layers (stride 64, 128, ...)
+        num_backbone_levels = len(features)
+        if self.n_levels > num_backbone_levels:
+            last_feat = features[-1]
+            for lvl in range(num_backbone_levels, self.n_levels):
+                if lvl == num_backbone_levels:
+                    src = self.input_proj[lvl](last_feat)
+                else:
+                    src = self.input_proj[lvl](srcs[-1])
+                B, C, H, W = src.shape
+                mask = (
+                    F.interpolate(
+                        masks.float().unsqueeze(1), size=(H, W), mode="nearest"
+                    )
+                    .bool()
+                    .squeeze(1)
+                )
+                pos = self.pos_enc(mask)
+                srcs.append(src)
+                ms_masks.append(mask)
+                pos_embeds.append(pos)
 
-        # 3. Prediction heads
+        # 2. Prepare DN queries (training only)
+        dn_label_embed = dn_bbox = dn_attn_mask = None
+        dn_meta = {}
+        if self.use_dn and self.training and targets is not None:
+            dn_label_ids, dn_bbox, dn_attn_mask, dn_meta = prepare_for_cdn(
+                targets, self.dn_number, self.dn_label_noise_ratio,
+                self.dn_box_noise_scale, self.num_queries,
+                self.num_classes, samples.device,
+            )
+            if dn_label_ids is not None:
+                dn_label_embed = self.label_enc(dn_label_ids)  # [B, pad, C]
+                dn_label_embed[~dn_meta['is_valid']] = 0
+
+        # 3. Learnable target embedding (embed_init_tgt)
+        tgt_override = None
+        if self.embed_init_tgt:
+            tgt_override = self.tgt_embed.weight.unsqueeze(0).expand(B, -1, -1)
+
+        # 4. Deformable transformer
+        query_embed_w = self.query_embed.weight if self.query_embed is not None else None
+        hs_stack, ref_stack, enc_outputs_dict = self.transformer(
+            srcs, ms_masks, pos_embeds, query_embed_w,
+            dn_label_embed=dn_label_embed, dn_bbox=dn_bbox,
+            dn_attn_mask=dn_attn_mask, tgt_embed_override=tgt_override,
+        )   # hs_stack: [n_dec, B, pad+Q, C], ref_stack: [n_dec, B, pad+Q, 2]
+
+        # 5. Split DN queries from detection queries
+        dn_hs_stack = None
+        dn_ref_stack = None
+        pad_size = dn_meta.get('pad_size', 0)
+        if pad_size > 0:
+            dn_hs_stack = hs_stack[:, :, :pad_size, :]
+            hs_stack = hs_stack[:, :, pad_size:, :]
+            dn_ref_stack = ref_stack[:, :, :pad_size, :]
+            ref_stack = ref_stack[:, :, pad_size:, :]
+
+        # 6. Prediction heads (detection queries only)
         outputs = {}
         if self.iterative_refine:
             # Each decoder layer has its own head
@@ -698,6 +1025,39 @@ class DETR(nn.Module):
             hs = hs_stack[-1]  # last decoder layer
             outputs["pred_logits"] = self.class_embed(hs)
             outputs["pred_boxes"] = self.bbox_embed(hs).sigmoid()
+
+        # Two-stage encoder output loss (for training)
+        if self.two_stage and enc_outputs_dict is not None and self.training:
+            outputs["enc_outputs"] = enc_outputs_dict
+
+        # 7. DN output predictions (for loss computation during training)
+        if dn_hs_stack is not None and self.training:
+            if self.iterative_refine:
+                dn_cls_all = []
+                dn_box_all = []
+                for lid in range(dn_hs_stack.shape[0]):
+                    dn_cls_all.append(self.class_embed[lid](dn_hs_stack[lid]))
+                    raw_box = self.bbox_embed[lid](dn_hs_stack[lid])
+                    ref = dn_ref_stack[lid]
+                    box_xy = (_inverse_sigmoid(ref) + raw_box[..., :2]).sigmoid()
+                    box_wh = raw_box[..., 2:].sigmoid()
+                    dn_box_all.append(torch.cat([box_xy, box_wh], dim=-1))
+                outputs['dn_outputs'] = {
+                    'pred_logits': dn_cls_all[-1],
+                    'pred_boxes': dn_box_all[-1],
+                }
+                if self.aux_loss:
+                    outputs['dn_outputs']['aux_outputs'] = [
+                        {'pred_logits': c, 'pred_boxes': b}
+                        for c, b in zip(dn_cls_all[:-1], dn_box_all[:-1])
+                    ]
+            else:
+                dn_hs = dn_hs_stack[-1]
+                outputs['dn_outputs'] = {
+                    'pred_logits': self.class_embed(dn_hs),
+                    'pred_boxes': self.bbox_embed(dn_hs).sigmoid(),
+                }
+            outputs['dn_meta'] = dn_meta
 
         return outputs
 

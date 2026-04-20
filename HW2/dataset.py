@@ -49,23 +49,6 @@ def _resize(image, target, size, max_size=None):
     return image, target
 
 
-class RandomHorizontalFlip:
-    def __init__(self, p=0.5):
-        self.p = p
-
-    def __call__(self, image, target):
-        if random.random() < self.p:
-            w, _ = image.size
-            image = TF.hflip(image)
-            if "boxes" in target and len(target["boxes"]) > 0:
-                boxes = target["boxes"].clone()
-                # x_new = w - x_old  => [x1,y1,x2,y2] -> [w-x2, y1, w-x1, y2]
-                boxes = boxes[:, [2, 1, 0, 3]] * torch.tensor([-1, 1, -1, 1]) \
-                        + torch.tensor([w, 0, w, 0])
-                target["boxes"] = boxes
-        return image, target
-
-
 class RandomResize:
     def __init__(self, sizes, max_size=None):
         self.sizes = sizes
@@ -332,6 +315,46 @@ def collate_fn(batch):
             boxes = tgt["boxes"]
             boxes[:, [0, 2]] = boxes[:, [0, 2]] * (w / max_w)
             boxes[:, [1, 3]] = boxes[:, [1, 3]] * (h / max_h)
+            tgt["boxes"] = boxes
+        new_targets.append(tgt)
+
+    return padded, masks, new_targets
+
+
+def collate_fn_train(batch):
+    """Like collate_fn but places each image at a random position within the
+    padded tensor (instead of always top-left).  Forces the model to learn
+    digit appearance, not absolute position."""
+    import random
+    images, targets = zip(*batch)
+
+    max_h = max(img.shape[1] for img in images)
+    max_w = max(img.shape[2] for img in images)
+
+    padded = torch.zeros(len(images), 3, max_h, max_w)
+    masks = torch.ones(len(images), max_h, max_w, dtype=torch.bool)
+
+    new_targets = []
+    for i, img in enumerate(images):
+        h, w = img.shape[1], img.shape[2]
+
+        pad_y = random.randint(0, max_h - h) if max_h > h else 0
+        pad_x = random.randint(0, max_w - w) if max_w > w else 0
+
+        padded[i, :, pad_y:pad_y + h, pad_x:pad_x + w] = img
+        masks[i, pad_y:pad_y + h, pad_x:pad_x + w] = False
+
+        tgt = {k: v.clone() if isinstance(v, torch.Tensor) else v
+               for k, v in targets[i].items()}
+        if "boxes" in tgt and len(tgt["boxes"]) > 0:
+            boxes = tgt["boxes"]
+            # Step 1: scale w/h outputs (indices 2,3) from image-normalised
+            #         to padded-tensor-normalised (same as original collate_fn)
+            boxes[:, [0, 2]] = boxes[:, [0, 2]] * (w / max_w)
+            boxes[:, [1, 3]] = boxes[:, [1, 3]] * (h / max_h)
+            # Step 2: shift cx/cy (indices 0,1) by the random padding offset
+            boxes[:, 0] = boxes[:, 0] + pad_x / max_w
+            boxes[:, 1] = boxes[:, 1] + pad_y / max_h
             tgt["boxes"] = boxes
         new_targets.append(tgt)
 

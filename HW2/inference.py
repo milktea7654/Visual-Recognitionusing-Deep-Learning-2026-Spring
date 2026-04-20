@@ -112,6 +112,10 @@ def run_inference(checkpoint_path, output_path="pred.json", score_threshold=0.3)
         pretrained_backbone=False,   # weights loaded from checkpoint
         aux_loss=False,              # no aux needed at inference
         iterative_refine=config.ITERATIVE_REFINE,
+        two_stage=getattr(config, 'TWO_STAGE', False),
+        two_stage_num_proposals=getattr(config, 'TWO_STAGE_NUM_PROPOSALS', 300),
+        use_dn=getattr(config, 'USE_DN', False),
+        embed_init_tgt=getattr(config, 'EMBED_INIT_TGT', False),
     ).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device)

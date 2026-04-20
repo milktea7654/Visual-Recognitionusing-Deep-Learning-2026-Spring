@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 import config
 from dataset import (
@@ -18,6 +19,7 @@ from dataset import (
     make_train_transforms,
     make_val_transforms,
     collate_fn,
+    collate_fn_train,
 )
 from model import DETR
 
@@ -212,6 +214,68 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha=0.25, gamma=2.0):
     return loss.mean(1).sum() / num_boxes
 
 
+def compute_dn_loss(dn_outputs, targets, dn_meta, num_classes,
+                    loss_cls_w, loss_bbox_w, loss_giou_w,
+                    focal_alpha, focal_gamma):
+    """Compute denoising loss with known GT assignment (no Hungarian matching).
+
+    Positive groups: cls + bbox + giou loss against original GT.
+    Negative groups: cls loss only (target = no class → push scores down).
+    """
+    is_valid = dn_meta['is_valid']        # [B, pad_size]
+    gt_indices = dn_meta['gt_indices']    # [B, pad_size]
+    is_negative = dn_meta['is_negative']  # [B, pad_size]
+    device = dn_outputs['pred_logits'].device
+
+    def _dn_loss_single(pred_logits, pred_boxes):
+        B, P, C = pred_logits.shape
+        target_onehot = torch.zeros_like(pred_logits)
+        target_boxes = torch.zeros_like(pred_boxes)
+
+        for b in range(B):
+            positive = is_valid[b] & ~is_negative[b]
+            if positive.any():
+                gt_idx = gt_indices[b][positive]
+                cls_idx = (targets[b]['labels'][gt_idx] - 1).long()
+                pos_indices = torch.where(positive)[0]
+                target_onehot[b, pos_indices, cls_idx] = 1.0
+                target_boxes[b][positive] = targets[b]['boxes'][gt_idx]
+
+        num_dn = max(is_valid.sum().item(), 1)
+        valid_flat = is_valid.flatten()
+
+        loss_cls = sigmoid_focal_loss(
+            pred_logits.flatten(0, 1)[valid_flat],
+            target_onehot.flatten(0, 1)[valid_flat],
+            num_dn, focal_alpha, focal_gamma,
+        )
+
+        is_positive = is_valid & ~is_negative
+        loss_bbox = torch.tensor(0.0, device=device)
+        loss_giou = torch.tensor(0.0, device=device)
+
+        if is_positive.any():
+            pos_pred = pred_boxes[is_positive]
+            pos_tgt = target_boxes[is_positive]
+            loss_bbox = F.l1_loss(pos_pred, pos_tgt, reduction='sum') / num_dn
+            loss_giou = (
+                1 - complete_box_iou_diag(
+                    box_cxcywh_to_xyxy(pos_pred),
+                    box_cxcywh_to_xyxy(pos_tgt),
+                )
+            ).sum() / num_dn
+
+        return loss_cls_w * loss_cls + loss_bbox_w * loss_bbox + loss_giou_w * loss_giou
+
+    total = _dn_loss_single(dn_outputs['pred_logits'], dn_outputs['pred_boxes'])
+
+    if 'aux_outputs' in dn_outputs:
+        for aux in dn_outputs['aux_outputs']:
+            total = total + _dn_loss_single(aux['pred_logits'], aux['pred_boxes'])
+
+    return total
+
+
 class DETRLoss(nn.Module):
     """Sigmoid focal loss + L1 + GIoU with bipartite matching + auxiliary losses."""
 
@@ -242,6 +306,7 @@ class DETRLoss(nn.Module):
         target_onehot = torch.zeros(
             (B, Q, C), dtype=torch.float32, device=pred_logits.device
         )
+        pred_boxes = outputs["pred_boxes"]
         for i, (row, col) in enumerate(indices):
             if len(row) > 0:
                 cls_idx = targets[i]["labels"][col] - 1
@@ -255,7 +320,6 @@ class DETRLoss(nn.Module):
             gamma=self.focal_gamma,
         )
 
-        pred_boxes = outputs["pred_boxes"]
         loss_bbox = torch.tensor(0.0, device=pred_logits.device)
         loss_giou = torch.tensor(0.0, device=pred_logits.device)
 
@@ -298,6 +362,31 @@ class DETRLoss(nn.Module):
                     aux_out, targets, aux_indices, num_boxes
                 )
                 total = total + aux_total
+
+        # ---- two-stage encoder output loss ----------------------------
+        if "enc_outputs" in outputs:
+            enc_out = outputs["enc_outputs"]
+            enc_cls_logits = enc_out["enc_cls_logits"]  # [B, Σ, C]
+            enc_proposals = enc_out["enc_bbox_proposals"]  # [B, Σ, 4]
+            # Build pseudo outputs dict for the matcher
+            enc_pseudo = {
+                "pred_logits": enc_cls_logits,
+                "pred_boxes": enc_proposals,
+            }
+            enc_indices = self.matcher(enc_pseudo, targets)
+            enc_total, _, _, _ = self._loss_single(
+                enc_pseudo, targets, enc_indices, num_boxes
+            )
+            total = total + enc_total
+
+        # ---- denoising loss (CDN) ------------------------------------
+        if "dn_outputs" in outputs and "dn_meta" in outputs:
+            dn_total = compute_dn_loss(
+                outputs["dn_outputs"], targets, outputs["dn_meta"],
+                self.num_classes, self.loss_cls_w, self.loss_bbox_w,
+                self.loss_giou_w, self.focal_alpha, self.focal_gamma,
+            )
+            total = total + dn_total
 
         # ---- class accuracy on matched pairs (final layer only) ------
         pred_logits = outputs["pred_logits"]
@@ -373,8 +462,8 @@ def train():
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
-        collate_fn=collate_fn,
-        pin_memory=True,
+        collate_fn=collate_fn_train,
+        pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -382,7 +471,7 @@ def train():
         shuffle=False,
         num_workers=config.NUM_WORKERS,
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
     )
 
     # ---- Model --------------------------------------------------------
@@ -401,6 +490,13 @@ def train():
         use_checkpoint=config.USE_CHECKPOINT,
         aux_loss=config.AUX_LOSS,
         iterative_refine=config.ITERATIVE_REFINE,
+        two_stage=getattr(config, 'TWO_STAGE', False),
+        two_stage_num_proposals=getattr(config, 'TWO_STAGE_NUM_PROPOSALS', 300),
+        use_dn=getattr(config, 'USE_DN', False),
+        dn_number=getattr(config, 'DN_NUMBER', 100),
+        dn_label_noise_ratio=getattr(config, 'DN_LABEL_NOISE_RATIO', 0.5),
+        dn_box_noise_scale=getattr(config, 'DN_BOX_NOISE_SCALE', 1.0),
+        embed_init_tgt=getattr(config, 'EMBED_INIT_TGT', False),
     ).to(device)
 
     # ---- Optional: freeze early backbone layers -----------------------
@@ -496,6 +592,11 @@ def train():
 
     writer = SummaryWriter(config.LOG_DIR)
 
+    # mAP evaluators
+    map_metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox").to(device)
+    map_metric_99 = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", iou_thresholds=[0.99]).to(device)
+    best_val_map = 0.0
+
     for epoch in range(start_epoch, config.NUM_EPOCHS + 1):
         # ----------------------------------------------------------------
         # Train
@@ -515,7 +616,7 @@ def train():
             targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                outputs = model(images, masks)
+                outputs = model(images, masks, targets=targets)
                 loss, loss_dict = criterion(outputs, targets)
                 loss = loss / accum_steps  # scale loss by accumulation steps
 
@@ -558,14 +659,45 @@ def train():
                 for k in val_totals:
                     val_totals[k] += loss_dict[k]
 
+                # Collect predictions for mAP
+                pred_logits = outputs["pred_logits"]
+                pred_boxes = outputs["pred_boxes"]
+                scores, labels = pred_logits.sigmoid().max(-1)
+
+                preds_list = []
+                targets_list = []
+                for i in range(len(targets)):
+                    keep = scores[i] > 0.05
+                    preds_list.append({
+                        "boxes": box_cxcywh_to_xyxy(pred_boxes[i][keep]),
+                        "scores": scores[i][keep],
+                        "labels": labels[i][keep],
+                    })
+                    targets_list.append({
+                        "boxes": box_cxcywh_to_xyxy(targets[i]["boxes"]),
+                        "labels": targets[i]["labels"] - 1,
+                    })
+                map_metric.update(preds_list, targets_list)
+                map_metric_99.update(preds_list, targets_list)
+
         n_val = len(val_loader)
         avg_val = val_totals["total"] / n_val
         val_metrics = {k: v / n_val for k, v in val_totals.items()}
         elapsed = time.time() - t0
 
+        # Compute mAP
+        map_results = map_metric.compute()
+        val_map = map_results["map"].item()
+        val_map_50 = map_results["map_50"].item()
+        val_map_75 = map_results["map_75"].item()
+        map_metric.reset()
+        val_map_99 = map_metric_99.compute()["map"].item()
+        map_metric_99.reset()
+
         print(
             f"Epoch {epoch:03d}  "
             f"train_loss={avg_train:.4f}  val_loss={avg_val:.4f}  "
+            f"mAP={val_map:.4f}  mAP@50={val_map_50:.4f}  mAP@75={val_map_75:.4f}  mAP@99={val_map_99:.4f}  "
             f"train_acc={train_metrics['cls_acc']:.3f}  "
             f"val_acc={val_metrics['cls_acc']:.3f}  "
             f"({elapsed:.0f}s)  "
@@ -593,6 +725,10 @@ def train():
                           optimizer.param_groups[0]["lr"], epoch)
         writer.add_scalar("lr/other",
                           optimizer.param_groups[1]["lr"], epoch)
+        writer.add_scalar("metrics/mAP", val_map, epoch)
+        writer.add_scalar("metrics/mAP_50", val_map_50, epoch)
+        writer.add_scalar("metrics/mAP_75", val_map_75, epoch)
+        writer.add_scalar("metrics/mAP_99", val_map_99, epoch)
 
         # ----------------------------------------------------------------
         # Save checkpoint
@@ -603,19 +739,18 @@ def train():
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "val_loss": avg_val,
+            "val_map": val_map,
         }
         torch.save(
             ckpt,
             os.path.join(config.CHECKPOINT_DIR, f"checkpoint_epoch_{epoch}.pth"),
         )
 
-        cur_val_acc = val_metrics["cls_acc"]
-        if cur_val_acc > best_val_acc:
-            best_val_acc = cur_val_acc
+        if val_map > best_val_map:
+            best_val_map = val_map
             best_val_loss = avg_val
-            ckpt["val_acc"] = best_val_acc
             torch.save(ckpt, os.path.join(config.OUTPUT_DIR, "best_model.pth"))
-            print(f"  -> Best model saved (val_acc={best_val_acc:.4f}, val_loss={avg_val:.4f})")
+            print(f"  -> Best model saved (mAP={best_val_map:.4f}, val_loss={avg_val:.4f})")
 
     writer.close()
     print("Training complete.")

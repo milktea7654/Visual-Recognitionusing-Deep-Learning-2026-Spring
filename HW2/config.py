@@ -20,17 +20,17 @@ LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 # ---------------------------------------------------------------------------
 NUM_CLASSES = 10        # digits 0-9 (category_id 1-10 in COCO JSON)
 # Images have max 6 digits; 20 queries gives safe headroom with less noise
-NUM_QUERIES = 15
-HIDDEN_DIM = 128        # reduced for simple digit task
-NHEADS = 8              # number of attention heads (must divide HIDDEN_DIM)
+NUM_QUERIES = 30
+HIDDEN_DIM = 256
+NHEADS = 4              # each head = 64 dim
 NUM_ENCODER_LAYERS = 3
 NUM_DECODER_LAYERS = 3
-DIM_FEEDFORWARD = 512   # 4× HIDDEN_DIM
+DIM_FEEDFORWARD = 512
 DROPOUT = 0.2
 PRETRAINED_BACKBONE = True
 
 # Deformable attention specific
-N_FEATURE_LEVELS = 3    # C3 / C4 / C5 from ResNet-50
+N_FEATURE_LEVELS = 4    # C3/C4/C5 from backbone + extra stride-64 level
 N_POINTS = 4            # sampling points per attention head per level
 USE_CHECKPOINT = False  # off for speed; BS=2 fits VRAM with C2 features
 
@@ -38,6 +38,19 @@ USE_CHECKPOINT = False  # off for speed; BS=2 fits VRAM with C2 features
 ITERATIVE_REFINE = True
 # Auxiliary losses from intermediate decoder layers (needed for from-scratch convergence)
 AUX_LOSS = True
+
+# Two-stage: encoder proposes top-K regions, decoder refines them
+TWO_STAGE = True
+TWO_STAGE_NUM_PROPOSALS = 30
+
+# Denoising training (DINO CDN)
+USE_DN = True
+DN_NUMBER = 100          # controls density of denoising groups
+DN_LABEL_NOISE_RATIO = 0.5
+DN_BOX_NOISE_SCALE = 1.0
+
+# Learnable initial target embedding (replaces encoder-derived content queries)
+EMBED_INIT_TGT = True
 
 # Backbone freeze option:
 #   True  = only train layers 3/4 of ResNet (freeze layer1/2)
@@ -48,26 +61,26 @@ FREEZE_BACKBONE_EARLY = False
 # Training
 # ---------------------------------------------------------------------------
 # Images are small (mean 128x57 px), so a larger batch fits in memory
-BATCH_SIZE = 4       # reduced for C2 feature VRAM
-GRAD_ACCUM_STEPS = 4    # accumulate 8 steps → effective batch = 16
+BATCH_SIZE = 8        # match reference config (RTX 4090 24GB)
+GRAD_ACCUM_STEPS = 2    # effective batch = 16
 # Deformable DETR converges ~10x faster than vanilla DETR; 100 epochs sufficient for 30k dataset
-NUM_EPOCHS = 50
+NUM_EPOCHS = 80
 
 # Optimizer
 OPTIMIZER = "adamw"     # "adamw" | "adam" | "sgd"
-LR = 1e-4               # from-scratch training needs higher LR
+LR = 1e-4               # halved to avoid bbox oscillation after cls converges
 LR_BACKBONE = 1e-5      # backbone is ImageNet-pretrained so keep 10x lower
-WEIGHT_DECAY = 5e-4
+WEIGHT_DECAY = 1e-4
 MOMENTUM = 0.9          # only used when OPTIMIZER = "sgd"
 
 # LR scheduler
 # "step"      : multiply LR by LR_GAMMA every LR_DROP epochs
 # "cosine"    : cosine annealing over NUM_EPOCHS
 # "multistep" : decay at epochs listed in LR_MILESTONES
-LR_SCHEDULER = "multistep"
-LR_DROP = 80
+LR_SCHEDULER = "step"
+LR_DROP = 15
 LR_GAMMA = 0.1
-LR_MILESTONES = [20, 35]
+LR_MILESTONES = [16, 30]  # unused with step scheduler
 
 GRAD_CLIP = 0.1
 
@@ -76,19 +89,19 @@ AMP = True              # True = use AMP for faster training
 AMP_DTYPE = "bfloat16"  # bf16 is faster than fp16 on Ampere+ GPUs (RTX 30xx/40xx/50xx)
 
 # Resume from checkpoint (set to path string to resume, None to start fresh)
-RESUME = None          # fresh start — new architecture dims incompatible with old checkpoint
+RESUME = None       # fresh start — new architecture dims incompatible with old checkpoint
 
 # ---------------------------------------------------------------------------
 # Loss coefficients (Hungarian matching + training loss)
 # ---------------------------------------------------------------------------
 # Matching costs — focal-loss-based class cost for better convergence
-COST_CLASS = 2.0        # matching: class cost weight (focal-based)
+COST_CLASS = 2.0        # matching: class cost weight (lower — cls already converged)
 COST_BBOX = 5.0         # matching: L1 bbox cost weight
-COST_GIOU = 2.0         # matching: GIoU cost weight
+COST_GIOU = 2.0         # matching: GIoU cost weight (raised — prioritise spatial fit)
 
 # Training loss weights (standard Deformable DETR weights)
-LOSS_CLS = 2.0          # sigmoid focal loss weight
-LOSS_BBOX = 5.0         # L1 bbox loss weight (standard Deformable DETR)
+LOSS_CLS = 1.0          # sigmoid focal loss weight
+LOSS_BBOX = 5.0         # L1 bbox loss weight
 LOSS_GIOU = 2.0         # GIoU weight
 
 # Focal loss hyperparameters (replaces softmax CE + eos_coef)
@@ -101,10 +114,12 @@ FOCAL_GAMMA = 2.0
 # Images are small (mean 128x57 px, max 876 px wide).
 # C3 (stride 8) in N_FEATURE_LEVELS=3 already handles fine detail.
 # Reduce scale range to limit interpolation artifacts on tiny digits.
-TRAIN_SIZES = [192, 224, 256]
-VAL_SIZE = 224
-MAX_SIZE = 448
-
+TRAIN_SIZES = [320]
+VAL_SIZE = 320
+MAX_SIZE = 640
+# TRAIN_SIZES = [224, 256, 288]
+# VAL_SIZE = 256
+# MAX_SIZE = 512
 # Extra augmentations (ColorJitter applied before resize)
 # House number images vary widely in lighting and color — keep jitter on
 USE_COLOR_JITTER = True
