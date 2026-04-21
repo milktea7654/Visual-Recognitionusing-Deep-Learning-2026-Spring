@@ -1,156 +1,229 @@
-"""Configuration for DETR digit detection (HW2)."""
+"""Configuration for DINO digit detection (HW2)."""
 import os
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 DATA_ROOT = "data"
-TRAIN_IMG_DIR = os.path.join(DATA_ROOT, "train")
-VAL_IMG_DIR = os.path.join(DATA_ROOT, "valid")
-TEST_IMG_DIR = os.path.join(DATA_ROOT, "test")
-TRAIN_JSON = os.path.join(DATA_ROOT, "train.json")
-VAL_JSON = os.path.join(DATA_ROOT, "valid.json")
+TRAIN_ANN     = os.path.join(DATA_ROOT, "train.json")
+VAL_ANN       = os.path.join(DATA_ROOT, "valid.json")
 
 OUTPUT_DIR = "output"
-CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
-LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 
 # ---------------------------------------------------------------------------
-# Model
+# Backbone
 # ---------------------------------------------------------------------------
-NUM_CLASSES = 10        # digits 0-9 (category_id 1-10 in COCO JSON)
-# Images have max 6 digits; 20 queries gives safe headroom with less noise
-NUM_QUERIES = 30
-HIDDEN_DIM = 256
-NHEADS = 4              # each head = 64 dim
-NUM_ENCODER_LAYERS = 3
-NUM_DECODER_LAYERS = 3
-DIM_FEEDFORWARD = 512
-DROPOUT = 0.2
-PRETRAINED_BACKBONE = True
+BACKBONE      = "resnet50"
+DILATION      = False
+RETURN_INTERM_INDICES = [1, 2, 3]
 
-# Deformable attention specific
-N_FEATURE_LEVELS = 4    # C3/C4/C5 from backbone + extra stride-64 level
-N_POINTS = 4            # sampling points per attention head per level
-USE_CHECKPOINT = False  # off for speed; BS=2 fits VRAM with C2 features
+# Positional encoding (separate H / W temperatures for rectangular images)
+PE_TEMPERATURE_H = 20
+PE_TEMPERATURE_W = 20
 
-# Iterative bounding box refinement (each decoder layer refines bbox)
-ITERATIVE_REFINE = True
-# Auxiliary losses from intermediate decoder layers (needed for from-scratch convergence)
+# ---------------------------------------------------------------------------
+# Transformer
+# ---------------------------------------------------------------------------
+NUM_CLASSES        = 11      # digits 0-9 + background class
+NUM_QUERIES        = 50      # safe headroom for typical ~6 digits/image
+HIDDEN_DIM         = 256
+NHEADS             = 4       # each head = 64 dim
+NUM_ENCODER_LAYERS = 4
+NUM_DECODER_LAYERS = 4
+DIM_FEEDFORWARD    = 512
+DROPOUT            = 0.2
+ACTIVATION         = "relu"
+PRE_NORM           = False
+
+# Multi-scale deformable attention
+NUM_FEATURE_LEVELS = 4
+ENC_POINTS = 4
+DEC_POINTS = 4
+
+# Two-stage proposal (encoder proposes top-K, decoder refines)
+TWO_STAGE_TYPE     = "standard"
+TWO_STAGE_LEARN_WH = False
+EMBED_INIT_TGT     = True
+
+# Decoder sub-layer order
+DECODER_SA_TYPE    = "sa"
+DECODER_MODULE_SEQ = ["sa", "ca", "ffn"]
+
+# Head weight sharing
+DEC_CLASS_SHARE        = True
+DEC_BBOX_SHARE         = True
+TWO_STAGE_CLASS_SHARE  = False
+TWO_STAGE_BBOX_SHARE   = False
+
+# ---------------------------------------------------------------------------
+# Denoising (CDN)
+# ---------------------------------------------------------------------------
+USE_DN              = True
+DN_NUMBER           = 10
+DN_LABEL_NOISE_RATIO = 0.5
+DN_BOX_NOISE_SCALE  = 0.4
+DN_LABELBOOK_SIZE   = 11
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
 AUX_LOSS = True
 
-# Two-stage: encoder proposes top-K regions, decoder refines them
-TWO_STAGE = True
-TWO_STAGE_NUM_PROPOSALS = 30
+# Matching cost weights
+COST_CLASS = 2.0
+COST_BBOX  = 5.0
+COST_GIOU  = 2.0
 
-# Denoising training (DINO CDN)
-USE_DN = True
-DN_NUMBER = 100          # controls density of denoising groups
-DN_LABEL_NOISE_RATIO = 0.5
-DN_BOX_NOISE_SCALE = 1.0
+# Training loss weights
+LOSS_CE_COEF   = 1.0
+LOSS_BBOX_COEF = 5.0
+LOSS_GIOU_COEF = 2.0
 
-# Learnable initial target embedding (replaces encoder-derived content queries)
-EMBED_INIT_TGT = True
+FOCAL_ALPHA = 0.2
 
-# Backbone freeze option:
-#   True  = only train layers 3/4 of ResNet (freeze layer1/2)
-#   False = train all backbone layers
-FREEZE_BACKBONE_EARLY = False
+INTERM_LOSS_COEF   = 1.0
+NO_INTERM_BOX_LOSS = False
+
+# Post-processing
+NUM_SELECT = 50
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-# Images are small (mean 128x57 px), so a larger batch fits in memory
-BATCH_SIZE = 8        # match reference config (RTX 4090 24GB)
-GRAD_ACCUM_STEPS = 2    # effective batch = 16
-# Deformable DETR converges ~10x faster than vanilla DETR; 100 epochs sufficient for 30k dataset
-NUM_EPOCHS = 80
+BATCH_SIZE          = 8
+EPOCHS              = 30
+LR                  = 1e-4
+LR_BACKBONE         = 1e-5
+LR_LINEAR_PROJ_MULT = 0.1
+WEIGHT_DECAY        = 1e-4
+GRAD_CLIP           = 0.1
+LR_DROP             = 15
+LR_ETA_MIN          = 1e-6
 
-# Optimizer
-OPTIMIZER = "adamw"     # "adamw" | "adam" | "sgd"
-LR = 1e-4               # halved to avoid bbox oscillation after cls converges
-LR_BACKBONE = 1e-5      # backbone is ImageNet-pretrained so keep 10x lower
-WEIGHT_DECAY = 1e-4
-MOMENTUM = 0.9          # only used when OPTIMIZER = "sgd"
-
-# LR scheduler
-# "step"      : multiply LR by LR_GAMMA every LR_DROP epochs
-# "cosine"    : cosine annealing over NUM_EPOCHS
-# "multistep" : decay at epochs listed in LR_MILESTONES
-LR_SCHEDULER = "step"
-LR_DROP = 15
-LR_GAMMA = 0.1
-LR_MILESTONES = [16, 30]  # unused with step scheduler
-
-GRAD_CLIP = 0.1
-
-# Mixed-precision training (requires CUDA)
-AMP = True              # True = use AMP for faster training
-AMP_DTYPE = "bfloat16"  # bf16 is faster than fp16 on Ampere+ GPUs (RTX 30xx/40xx/50xx)
-
-# Resume from checkpoint (set to path string to resume, None to start fresh)
-RESUME = None       # fresh start — new architecture dims incompatible with old checkpoint
+RESUME = ""
 
 # ---------------------------------------------------------------------------
-# Loss coefficients (Hungarian matching + training loss)
+# Augmentation
 # ---------------------------------------------------------------------------
-# Matching costs — focal-loss-based class cost for better convergence
-COST_CLASS = 2.0        # matching: class cost weight (lower — cls already converged)
-COST_BBOX = 5.0         # matching: L1 bbox cost weight
-COST_GIOU = 2.0         # matching: GIoU cost weight (raised — prioritise spatial fit)
+TRAIN_SHORT_EDGE = 320
+TRAIN_MAX_SIZE   = 640
+TRAIN_SCALE_MIN  = 0.9
+TRAIN_SCALE_MAX  = 1.0
+VAL_SHORT_EDGE   = 320
+VAL_MAX_SIZE     = 640
 
-# Training loss weights (standard Deformable DETR weights)
-LOSS_CLS = 1.0          # sigmoid focal loss weight
-LOSS_BBOX = 5.0         # L1 bbox loss weight
-LOSS_GIOU = 2.0         # GIoU weight
+AUG_DEGREES          = 5.0
+AUG_TRANSLATE        = (0.1, 0.1)
+AUG_PERSPECTIVE_SCALE = 0.1
+AUG_PERSPECTIVE_P    = 0.5
+AUG_BLUR_SIGMA       = (0.1, 2.0)
+AUG_BLUR_P           = 0.5
+AUG_MIN_VISIBILITY   = 0.5
+AUG_ROTATION_P       = 0.0
+AUG_COLOR_JITTER_P   = 0.8
+AUG_ISO_NOISE        = True
+AUG_ISO_NOISE_P      = 0.2
+AUG_ISO_NOISE_INTENSITY = 0.05
+AUG_CROP_P           = 0.5
+AUG_CROP_SCALE       = (0.6, 1.0)
 
-# Focal loss hyperparameters (replaces softmax CE + eos_coef)
-FOCAL_ALPHA = 0.25
-FOCAL_GAMMA = 2.0
-
-# ---------------------------------------------------------------------------
-# Data augmentation / resize
-# ---------------------------------------------------------------------------
-# Images are small (mean 128x57 px, max 876 px wide).
-# C3 (stride 8) in N_FEATURE_LEVELS=3 already handles fine detail.
-# Reduce scale range to limit interpolation artifacts on tiny digits.
-TRAIN_SIZES = [320]
-VAL_SIZE = 320
-MAX_SIZE = 640
-# TRAIN_SIZES = [224, 256, 288]
-# VAL_SIZE = 256
-# MAX_SIZE = 512
-# Extra augmentations (ColorJitter applied before resize)
-# House number images vary widely in lighting and color — keep jitter on
-USE_COLOR_JITTER = True
-COLOR_JITTER_BRIGHTNESS = 0.2
-COLOR_JITTER_CONTRAST = 0.2
-COLOR_JITTER_SATURATION = 0.2
-COLOR_JITTER_HUE = 0.05
-
-# Random crop — DISABLED for digit detection: images are tiny (128×57 px avg),
-# cropping risks cutting digits in half and corrupting labels.
-USE_RANDOM_CROP = False
-RANDOM_CROP_MIN = 256
-RANDOM_CROP_MAX = 384
-
-# Random erasing (applied after normalization)
-USE_RANDOM_ERASING = True
-RANDOM_ERASING_P = 0.2
-
-# Gaussian blur (safe augmentation, simulates out-of-focus cameras)
-USE_GAUSSIAN_BLUR = False
-GAUSSIAN_BLUR_P = 0.3
-
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-# Lower threshold helps recall small digits; raise if too many false positives
-SCORE_THRESHOLD = 0
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
-DEVICE = "cuda"
-NUM_WORKERS = 8         # 8 workers; GPU step=400ms so data loading must stay ahead
-SEED = 42
+DEVICE      = "cuda"
+SEED        = 42
+NUM_WORKERS = 6
 
+
+def get_config():
+    """Return all settings as a flat dictionary usable by build_model() etc."""
+    return {
+        # paths
+        "data_path": DATA_ROOT,
+        "train_json": os.path.basename(TRAIN_ANN),
+        "valid_json": os.path.basename(VAL_ANN),
+        "output_dir": OUTPUT_DIR,
+        # backbone
+        "backbone": BACKBONE,
+        "dilation": DILATION,
+        "return_interm_indices": list(RETURN_INTERM_INDICES),
+        "lr_backbone": LR_BACKBONE,
+        "pe_temperatureH": PE_TEMPERATURE_H,
+        "pe_temperatureW": PE_TEMPERATURE_W,
+        # transformer
+        "num_classes": NUM_CLASSES,
+        "num_queries": NUM_QUERIES,
+        "hidden_dim": HIDDEN_DIM,
+        "nheads": NHEADS,
+        "enc_layers": NUM_ENCODER_LAYERS,
+        "dec_layers": NUM_DECODER_LAYERS,
+        "dim_feedforward": DIM_FEEDFORWARD,
+        "dropout": DROPOUT,
+        "transformer_activation": ACTIVATION,
+        "pre_norm": PRE_NORM,
+        "num_feature_levels": NUM_FEATURE_LEVELS,
+        "enc_n_points": ENC_POINTS,
+        "dec_n_points": DEC_POINTS,
+        "two_stage_type": TWO_STAGE_TYPE,
+        "two_stage_learn_wh": TWO_STAGE_LEARN_WH,
+        "embed_init_tgt": EMBED_INIT_TGT,
+        "decoder_sa_type": DECODER_SA_TYPE,
+        "decoder_module_seq": list(DECODER_MODULE_SEQ),
+        "dec_pred_class_embed_share": DEC_CLASS_SHARE,
+        "dec_pred_bbox_embed_share": DEC_BBOX_SHARE,
+        "two_stage_class_embed_share": TWO_STAGE_CLASS_SHARE,
+        "two_stage_bbox_embed_share": TWO_STAGE_BBOX_SHARE,
+        # denoising
+        "use_dn": USE_DN,
+        "dn_number": DN_NUMBER,
+        "dn_label_noise_ratio": DN_LABEL_NOISE_RATIO,
+        "dn_box_noise_scale": DN_BOX_NOISE_SCALE,
+        "dn_labelbook_size": DN_LABELBOOK_SIZE,
+        # loss
+        "aux_loss": AUX_LOSS,
+        "set_cost_class": COST_CLASS,
+        "set_cost_bbox": COST_BBOX,
+        "set_cost_giou": COST_GIOU,
+        "cls_loss_coef": LOSS_CE_COEF,
+        "bbox_loss_coef": LOSS_BBOX_COEF,
+        "giou_loss_coef": LOSS_GIOU_COEF,
+        "focal_alpha": FOCAL_ALPHA,
+        "interm_loss_coef": INTERM_LOSS_COEF,
+        "no_interm_box_loss": NO_INTERM_BOX_LOSS,
+        "num_select": NUM_SELECT,
+        # training
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "lr": LR,
+        "lr_linear_proj_mult": LR_LINEAR_PROJ_MULT,
+        "weight_decay": WEIGHT_DECAY,
+        "clip_max_norm": GRAD_CLIP,
+        "lr_drop": LR_DROP,
+        "lr_eta_min": LR_ETA_MIN,
+        "resume": RESUME,
+        # augmentation
+        "train_short_edge": TRAIN_SHORT_EDGE,
+        "train_max_size": TRAIN_MAX_SIZE,
+        "train_random_scale_min": TRAIN_SCALE_MIN,
+        "train_random_scale_max": TRAIN_SCALE_MAX,
+        "val_short_edge": VAL_SHORT_EDGE,
+        "val_max_size": VAL_MAX_SIZE,
+        "augment_degrees": AUG_DEGREES,
+        "augment_translate": list(AUG_TRANSLATE),
+        "augment_perspective_scale": AUG_PERSPECTIVE_SCALE,
+        "augment_perspective_p": AUG_PERSPECTIVE_P,
+        "augment_blur_sigma": list(AUG_BLUR_SIGMA),
+        "augment_blur_p": AUG_BLUR_P,
+        "augment_min_visibility": AUG_MIN_VISIBILITY,
+        "aug_rotation_p": AUG_ROTATION_P,
+        "aug_color_jitter_p": AUG_COLOR_JITTER_P,
+        "aug_iso_noise": AUG_ISO_NOISE,
+        "aug_iso_noise_p": AUG_ISO_NOISE_P,
+        "aug_iso_noise_intensity": AUG_ISO_NOISE_INTENSITY,
+        "aug_crop_p": AUG_CROP_P,
+        "aug_crop_scale": list(AUG_CROP_SCALE),
+        # misc
+        "device": DEVICE,
+        "seed": SEED,
+        "num_workers": NUM_WORKERS,
+    }
