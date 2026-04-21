@@ -26,9 +26,6 @@ python train.py
 ```
 
 ### Inference
-
-How to run inference. (Replace the checkpoint path with your actual best model)
-
 ```bash
 python inference.py --checkpoint output/20260421_015205/best.pth --batch_size 8
 ```
