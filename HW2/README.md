@@ -1,13 +1,11 @@
 # NYCU Computer Vision 2026 HW2
 
-- **Student ID:** [Your Student ID]
-- **Name:** [Your Name]
+- **Student ID:** 112550200
+- **Name:** Zheng Wu Qian
 
 ## Introduction
 
 This repository contains the implementation for NYCU Computer Vision 2026 HW2. The goal is to perform object detection on a multiple-digit dataset. The core architecture relies on **DINO (DEtection TRansformer with Improved DeNoising)**, utilizing a ResNet-50 backbone. 
-
-*(Note: Detailed records of additional experiments, loss modifications, and performance implications can be found in [`output/experiment_results.md`](output/experiment_results.md).)*
 
 ## Environment Setup
 
@@ -40,4 +38,4 @@ python inference.py --checkpoint output/20260421_015205/best.pth --batch_size 8
 Insert a screenshot of the leaderboard here.
 
 *(Please provide the screenshot of your highest mAP submission below)*
-![Leaderboard Snapshot](placeholder_for_leaderboard_screenshot.png)
+![Leaderboard Snapshot](leaderboard.png)

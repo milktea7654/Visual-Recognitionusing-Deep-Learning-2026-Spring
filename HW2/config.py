@@ -5,16 +5,16 @@ import os
 # Paths
 # ---------------------------------------------------------------------------
 DATA_ROOT = "data"
-TRAIN_ANN     = os.path.join(DATA_ROOT, "train.json")
-VAL_ANN       = os.path.join(DATA_ROOT, "valid.json")
+TRAIN_ANN = os.path.join(DATA_ROOT, "train.json")
+VAL_ANN = os.path.join(DATA_ROOT, "valid.json")
 
 OUTPUT_DIR = "output"
 
 # ---------------------------------------------------------------------------
 # Backbone
 # ---------------------------------------------------------------------------
-BACKBONE      = "resnet50"
-DILATION      = False
+BACKBONE = "resnet50"
+DILATION = False
 RETURN_INTERM_INDICES = [1, 2, 3]
 
 # Positional encoding (separate H / W temperatures for rectangular images)
@@ -24,16 +24,16 @@ PE_TEMPERATURE_W = 20
 # ---------------------------------------------------------------------------
 # Transformer
 # ---------------------------------------------------------------------------
-NUM_CLASSES        = 11      # digits 0-9 + background class
-NUM_QUERIES        = 50      # safe headroom for typical ~6 digits/image
-HIDDEN_DIM         = 256
-NHEADS             = 4       # each head = 64 dim
+NUM_CLASSES = 11  # digits 0-9 + background class
+NUM_QUERIES = 30  # safe headroom for typical ~6 digits/image
+HIDDEN_DIM = 256
+NHEADS = 4  # each head = 64 dim
 NUM_ENCODER_LAYERS = 4
 NUM_DECODER_LAYERS = 4
-DIM_FEEDFORWARD    = 512
-DROPOUT            = 0.2
-ACTIVATION         = "relu"
-PRE_NORM           = False
+DIM_FEEDFORWARD = 512
+DROPOUT = 0.2
+ACTIVATION = "relu"
+PRE_NORM = False
 
 # Multi-scale deformable attention
 NUM_FEATURE_LEVELS = 4
@@ -41,28 +41,28 @@ ENC_POINTS = 4
 DEC_POINTS = 4
 
 # Two-stage proposal (encoder proposes top-K, decoder refines)
-TWO_STAGE_TYPE     = "standard"
+TWO_STAGE_TYPE = "standard"
 TWO_STAGE_LEARN_WH = False
-EMBED_INIT_TGT     = True
+EMBED_INIT_TGT = True
 
 # Decoder sub-layer order
-DECODER_SA_TYPE    = "sa"
+DECODER_SA_TYPE = "sa"
 DECODER_MODULE_SEQ = ["sa", "ca", "ffn"]
 
 # Head weight sharing
-DEC_CLASS_SHARE        = True
-DEC_BBOX_SHARE         = True
-TWO_STAGE_CLASS_SHARE  = False
-TWO_STAGE_BBOX_SHARE   = False
+DEC_CLASS_SHARE = True
+DEC_BBOX_SHARE = True
+TWO_STAGE_CLASS_SHARE = False
+TWO_STAGE_BBOX_SHARE = False
 
 # ---------------------------------------------------------------------------
 # Denoising (CDN)
 # ---------------------------------------------------------------------------
-USE_DN              = True
-DN_NUMBER           = 10
+USE_DN = True
+DN_NUMBER = 10
 DN_LABEL_NOISE_RATIO = 0.5
-DN_BOX_NOISE_SCALE  = 0.4
-DN_LABELBOOK_SIZE   = 11
+DN_BOX_NOISE_SCALE = 0.4
+DN_LABELBOOK_SIZE = 11
 
 # ---------------------------------------------------------------------------
 # Loss
@@ -71,67 +71,71 @@ AUX_LOSS = True
 
 # Matching cost weights
 COST_CLASS = 2.0
-COST_BBOX  = 5.0
-COST_GIOU  = 2.0
+COST_BBOX = 5.0
+COST_GIOU = 2.0
 
 # Training loss weights
-LOSS_CE_COEF   = 1.0
+LOSS_CE_COEF = 1.0
 LOSS_BBOX_COEF = 5.0
 LOSS_GIOU_COEF = 2.0
 
 FOCAL_ALPHA = 0.2
 
-INTERM_LOSS_COEF   = 1.0
+INTERM_LOSS_COEF = 1.0
 NO_INTERM_BOX_LOSS = False
 
 # Post-processing
-NUM_SELECT = 50
+NUM_SELECT = 30
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-BATCH_SIZE          = 8
-EPOCHS              = 30
-LR                  = 1e-4
-LR_BACKBONE         = 1e-5
+BATCH_SIZE = 8
+EPOCHS = 30
+LR = 1e-4
+LR_BACKBONE = 1e-5
 LR_LINEAR_PROJ_MULT = 0.1
-WEIGHT_DECAY        = 1e-4
-GRAD_CLIP           = 0.1
-LR_DROP             = 15
-LR_ETA_MIN          = 1e-6
+WEIGHT_DECAY = 1e-4
+GRAD_CLIP = 0.1
+LR_DROP = 15
+LR_ETA_MIN = 1e-6
 
 RESUME = ""
 
 # ---------------------------------------------------------------------------
 # Augmentation
 # ---------------------------------------------------------------------------
+# Image Sizes
 TRAIN_SHORT_EDGE = 320
-TRAIN_MAX_SIZE   = 640
-TRAIN_SCALE_MIN  = 0.9
-TRAIN_SCALE_MAX  = 1.0
-VAL_SHORT_EDGE   = 320
-VAL_MAX_SIZE     = 640
+TRAIN_MAX_SIZE = 640
+VAL_SHORT_EDGE = 320
+VAL_MAX_SIZE = 640
 
-AUG_DEGREES          = 5.0
-AUG_TRANSLATE        = (0.1, 0.1)
+# Augmentation: Geometric
+AUG_SCALE_MIN = 0.9
+AUG_SCALE_MAX = 1.0
+AUG_CROP_PROB = 0.5
+AUG_CROP_SCALE = (0.6, 1.0)
+AUG_ROTATION_PROB = 0.0
+AUG_ROTATION_DEGREES = 5.0
+AUG_TRANSLATE_XY = (0.1, 0.1)
+AUG_PERSPECTIVE_PROB = 0.5
 AUG_PERSPECTIVE_SCALE = 0.1
-AUG_PERSPECTIVE_P    = 0.5
-AUG_BLUR_SIGMA       = (0.1, 2.0)
-AUG_BLUR_P           = 0.5
-AUG_MIN_VISIBILITY   = 0.5
-AUG_ROTATION_P       = 0.0
-AUG_COLOR_JITTER_P   = 0.8
-AUG_ISO_NOISE        = True
-AUG_ISO_NOISE_P      = 0.2
-AUG_ISO_NOISE_INTENSITY = 0.05
-AUG_CROP_P           = 0.5
-AUG_CROP_SCALE       = (0.6, 1.0)
+AUG_MIN_VISIBILITY = 0.5
+
+# Augmentation: Photometric
+AUG_COLOR_JITTER_PROB = 0.8
+AUG_BLUR_PROB = 0.5
+AUG_BLUR_SIGMA = (0.1, 2.0)
+AUG_USE_ISO_NOISE = True
+AUG_ISO_NOISE_PROB = 0.2
+AUG_ISO_NOISE_INTENS = 0.05
 
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
-DEVICE      = "cuda"
-SEED        = 42
+DEVICE = "cuda"
+SEED = 42
 NUM_WORKERS = 6
 
 
@@ -204,24 +208,24 @@ def get_config():
         # augmentation
         "train_short_edge": TRAIN_SHORT_EDGE,
         "train_max_size": TRAIN_MAX_SIZE,
-        "train_random_scale_min": TRAIN_SCALE_MIN,
-        "train_random_scale_max": TRAIN_SCALE_MAX,
         "val_short_edge": VAL_SHORT_EDGE,
         "val_max_size": VAL_MAX_SIZE,
-        "augment_degrees": AUG_DEGREES,
-        "augment_translate": list(AUG_TRANSLATE),
-        "augment_perspective_scale": AUG_PERSPECTIVE_SCALE,
-        "augment_perspective_p": AUG_PERSPECTIVE_P,
-        "augment_blur_sigma": list(AUG_BLUR_SIGMA),
-        "augment_blur_p": AUG_BLUR_P,
-        "augment_min_visibility": AUG_MIN_VISIBILITY,
-        "aug_rotation_p": AUG_ROTATION_P,
-        "aug_color_jitter_p": AUG_COLOR_JITTER_P,
-        "aug_iso_noise": AUG_ISO_NOISE,
-        "aug_iso_noise_p": AUG_ISO_NOISE_P,
-        "aug_iso_noise_intensity": AUG_ISO_NOISE_INTENSITY,
-        "aug_crop_p": AUG_CROP_P,
+        "aug_scale_min": AUG_SCALE_MIN,
+        "aug_scale_max": AUG_SCALE_MAX,
+        "aug_crop_prob": AUG_CROP_PROB,
         "aug_crop_scale": list(AUG_CROP_SCALE),
+        "aug_rotation_prob": AUG_ROTATION_PROB,
+        "aug_rotation_degrees": AUG_ROTATION_DEGREES,
+        "aug_translate_xy": list(AUG_TRANSLATE_XY),
+        "aug_perspective_prob": AUG_PERSPECTIVE_PROB,
+        "aug_perspective_scale": AUG_PERSPECTIVE_SCALE,
+        "aug_min_visibility": AUG_MIN_VISIBILITY,
+        "aug_color_jitter_prob": AUG_COLOR_JITTER_PROB,
+        "aug_blur_prob": AUG_BLUR_PROB,
+        "aug_blur_sigma": list(AUG_BLUR_SIGMA),
+        "aug_use_iso_noise": AUG_USE_ISO_NOISE,
+        "aug_iso_noise_prob": AUG_ISO_NOISE_PROB,
+        "aug_iso_noise_intensity": AUG_ISO_NOISE_INTENS,
         # misc
         "device": DEVICE,
         "seed": SEED,

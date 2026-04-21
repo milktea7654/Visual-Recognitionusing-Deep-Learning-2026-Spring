@@ -386,31 +386,30 @@ def build_augmentations(split, cfg=None):
     if split == "train":
         se = c.get("train_short_edge", 320)
         ms = c.get("train_max_size", 640)
-        mv = c.get("augment_min_visibility", .5)
+        mv = c.get("aug_min_visibility", .5)
         ops = [
-            PhotometricJitter(prob=c.get("aug_color_jitter_p", 1.)),
-            BlurAugment(sigma=tuple(c.get("augment_blur_sigma", [.1, 2.])),
-                        prob=c.get("augment_blur_p", .5)),
+            PhotometricJitter(prob=c.get("aug_color_jitter_prob", 1.)),
+            BlurAugment(sigma=tuple(c.get("aug_blur_sigma", [.1, 2.])),
+                        prob=c.get("aug_blur_prob", .5)),
         ]
-        if c.get("aug_iso_noise", False):
+        if c.get("aug_use_iso_noise", False):
             ops.append(
-                SensorNoise(prob=c.get("aug_iso_noise_p", .2),
+                SensorNoise(prob=c.get("aug_iso_noise_prob", .2),
                             strength=c.get("aug_iso_noise_intensity", .05)))
         ops += [
-            AffineRotation(max_deg=c.get("augment_degrees", 10.),
-                           translate=tuple(c.get("augment_translate",
-                                                 [.1, .1])),
+            AffineRotation(max_deg=c.get("aug_rotation_degrees", 10.),
+                           translate=tuple(c.get("aug_translate_xy", [.1, .1])),
                            vis_thr=mv,
-                           prob=c.get("aug_rotation_p", 1.)),
-            PerspectiveWarp(strength=c.get("augment_perspective_scale", .1),
-                            prob=c.get("augment_perspective_p", .5),
+                           prob=c.get("aug_rotation_prob", 1.)),
+            PerspectiveWarp(strength=c.get("aug_perspective_scale", .1),
+                            prob=c.get("aug_perspective_prob", .5),
                             vis_thr=mv),
             BoxAwareCrop(scale_range=tuple(c.get("aug_crop_scale", [.6, 1.])),
-                         prob=c.get("aug_crop_p", .5),
+                         prob=c.get("aug_crop_prob", .5),
                          vis_thr=mv),
             ScaleJitter([se], max_side=ms),
-            ContinuousScale(c.get("train_random_scale_min", .9),
-                            c.get("train_random_scale_max", 1.)),
+            ContinuousScale(c.get("aug_scale_min", .9),
+                            c.get("aug_scale_max", 1.)),
             tail,
         ]
         return AugPipeline(ops)
