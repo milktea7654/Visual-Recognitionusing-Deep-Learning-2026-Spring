@@ -35,7 +35,4 @@ python inference.py --checkpoint output/20260421_015205/best.pth --batch_size 8
 
 ## Performance Snapshot
 
-Insert a screenshot of the leaderboard here.
-
-*(Please provide the screenshot of your highest mAP submission below)*
 ![Leaderboard Snapshot](leaderboard.png)
