@@ -1,0 +1,23 @@
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Hugging Face Mask2Former (includes Swin backbone)
+transformers>=4.38.0
+accelerate>=0.27.0
+
+# Image I/O (.tif support – handles LZW, BigTIFF, uint16, multi-page)
+tifffile>=2023.7.18
+imagecodecs>=2023.7.10   # required codec backend for tifffile
+
+# COCO tools (RLE encoding + evaluation)
+pycocotools>=2.0.7
+
+# Numerics
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Misc utilities
+tqdm>=4.66.0
+
+tensorboard
