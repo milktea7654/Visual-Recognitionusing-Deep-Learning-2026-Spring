@@ -1,0 +1,27 @@
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Image I/O (.tif support – handles LZW, BigTIFF, uint16, multi-page)
+tifffile>=2023.7.18
+imagecodecs>=2023.7.10   # required codec backend for tifffile
+
+# COCO tools (RLE encoding + evaluation)
+pycocotools>=2.0.7
+
+# Numerics
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Misc utilities
+tqdm>=4.66.0
+tensorboard
+
+# Heavy augmentation
+albumentations>=1.3.1
+
+# ConvNeXt-V2 backbone (ImageNet-1K weights only)
+transformers>=4.40.0
+
+# Weighted Box Fusion for ensemble inference (TTA)
+ensemble-boxes>=1.0.8
