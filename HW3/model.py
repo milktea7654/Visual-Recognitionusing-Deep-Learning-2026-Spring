@@ -1,48 +1,434 @@
 """
-model.py – Mask2Former model wrapper for 4-class medical cell segmentation.
+model.py – ConvNeXt(V1/V2)-Base + FPN + Mask R-CNN.
 
-Uses Hugging Face ``transformers`` Mask2Former with a ConvNeXt-V2-Base backbone.
+Improvements over baseline:
+* Multi-scale training (random min_size in MULTI_SCALE_MIN_SIZES per iter)
+* Higher-resolution mask head (28x28 RoIAlign → 56x56 mask logits)
+* Optional ConvNeXt-V2-Base backbone (HF, ImageNet-1K only weights)
+* Optional Cascade Mask R-CNN (3 IoU stages: 0.5 → 0.6 → 0.7)
 
-Weight initialisation policy
------------------------------
-* **Backbone (ConvNeXt-V2-Base)**: ImageNet-1K pretrained weights loaded from
-  ``facebook/convnextv2-base-1k-224``.
-* **Pixel Decoder, Transformer Decoder, class/mask heads**: randomly
-  initialised – no COCO or any other external-dataset weights used.
-
-This satisfies the homework constraint that only ImageNet-1K pretrained
-weights are permitted.
-
-Architecture overview
----------------------
-ConvNeXt-V2-Base backbone → Pixel Decoder (multi-scale deformable attention) →
-Transformer Decoder (N queries) → per-query class + binary mask heads.
-
-Why ConvNeXt-V2-Base over V1:
-  * Global Response Normalization (GRN) prevents feature collapse across
-    channels, giving richer multi-scale representations.
-  * Same parameter count (~89 M backbone), same API, drop-in replacement.
-  * ImageNet-1K top-1: 86.8 % vs 85.8 % for V1-Base.
+Weight policy: backbone uses ImageNet-1K weights only; FPN/RPN/heads are
+randomly initialised.
 """
 
 from __future__ import annotations
 
-from types import MethodType
-from typing import Dict, Optional
+import copy
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import (
-    Mask2FormerConfig,
-    Mask2FormerForUniversalSegmentation,
+import torch.nn.functional as F
+from torchvision.models import convnext_base, ConvNeXt_Base_Weights
+from torchvision.models.detection import MaskRCNN
+from torchvision.models.detection._utils import (
+    BalancedPositiveNegativeSampler,
+    BoxCoder,
+    Matcher,
 )
+from torchvision.models.detection.anchor_utils import AnchorGenerator
+from torchvision.models.detection.roi_heads import fastrcnn_loss, maskrcnn_loss
+from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.ops import (
+    FeaturePyramidNetwork,
+    MultiScaleRoIAlign,
+    batched_nms,
+    box_iou,
+    clip_boxes_to_image,
+)
+from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
+
+import config
 
 
 # ---------------------------------------------------------------------------
-# Class labels (0 = no-object / background, 1-4 = cell classes)
+# Backbone variants
 # ---------------------------------------------------------------------------
 
-NUM_CLASSES = 4  # foreground classes; the model adds 1 for the "no-object" cls
+
+def _build_convnext_v1_backbone() -> nn.Module:
+    """torchvision ConvNeXt-Base, ImageNet-1K-V1 weights."""
+    net = convnext_base(weights=ConvNeXt_Base_Weights.IMAGENET1K_V1)
+    body = create_feature_extractor(net, return_nodes=config.BACKBONE_RETURN_NODES)
+    return body
+
+
+def _build_convnextv2_base_backbone() -> nn.Module:
+    """
+    HF ConvNeXt-V2-Base (facebook/convnextv2-base-1k-224).
+
+    Returns a module whose forward returns OrderedDict("0".."3") matching
+    the V1 feature-extractor signature, so it drops into FPN.
+    """
+    from transformers import ConvNextV2Model
+
+    hf_model = ConvNextV2Model.from_pretrained(
+        "facebook/convnextv2-base-1k-224", output_hidden_states=True
+    )
+
+    class V2Wrapper(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, x):
+            out = self.m(pixel_values=x)
+            # hidden_states: (stem, stage1, stage2, stage3, stage4)
+            hs = out.hidden_states
+            return OrderedDict([
+                ("0", hs[1]),
+                ("1", hs[2]),
+                ("2", hs[3]),
+                ("3", hs[4]),
+            ])
+
+    return V2Wrapper(hf_model)
+
+
+class ConvNeXtFPNBackbone(nn.Module):
+    """ConvNeXt(V1 or V2) + FPN backbone for torchvision MaskRCNN."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        if config.BACKBONE_NAME == "convnext_base":
+            self.body = _build_convnext_v1_backbone()
+        elif config.BACKBONE_NAME == "convnextv2_base":
+            self.body = _build_convnextv2_base_backbone()
+        else:
+            raise ValueError(f"Unknown BACKBONE_NAME: {config.BACKBONE_NAME}")
+
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=config.BACKBONE_IN_CHANNELS,
+            out_channels=config.BACKBONE_OUT_CHANNELS,
+            extra_blocks=LastLevelMaxPool(),
+        )
+        self.out_channels = config.BACKBONE_OUT_CHANNELS
+
+    def forward(self, x: torch.Tensor) -> "OrderedDict[str, torch.Tensor]":
+        feats = self.body(x)
+        return self.fpn(feats)
+
+
+# ---------------------------------------------------------------------------
+# Cascade Mask R-CNN RoI Heads
+# ---------------------------------------------------------------------------
+
+
+class CascadeRoIHeads(nn.Module):
+    """
+    Cascade Mask R-CNN RoI heads (Cai & Vasconcelos, CVPR 2018).
+
+    Three cascade stages with IoU thresholds (0.5 → 0.6 → 0.7):
+    - Training  : independent IoU assignment + detection loss per stage,
+                  mask loss computed on final-stage positive proposals.
+    - Inference : sequential box refinement, ensemble class scores (avg
+                  softmax), per-class batched NMS, mask on final boxes.
+
+    Drop-in replacement for torchvision RoIHeads; same (result, losses)
+    interface so GeneralizedRCNN / MaskRCNN forward needs no changes.
+    """
+
+    CASCADE_IOUS: Tuple[float, ...] = (0.5, 0.6, 0.7)
+
+    def __init__(
+        self,
+        box_roi_pool: MultiScaleRoIAlign,
+        box_heads: nn.ModuleList,       # one TwoMLPHead per stage
+        box_predictors: nn.ModuleList,  # one FastRCNNPredictor per stage
+        num_classes: int,
+        batch_size_per_image: int = 512,
+        positive_fraction: float = 0.25,
+        bbox_reg_weights: Tuple[float, ...] = (10.0, 10.0, 5.0, 5.0),
+        score_thresh: float = 0.05,
+        nms_thresh: float = 0.5,
+        detections_per_img: int = 500,
+        mask_roi_pool: Optional[MultiScaleRoIAlign] = None,
+        mask_head: Optional[nn.Module] = None,
+        mask_predictor: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        assert len(box_heads) == len(self.CASCADE_IOUS)
+        assert len(box_predictors) == len(self.CASCADE_IOUS)
+
+        self.box_roi_pool = box_roi_pool
+        self.box_heads = box_heads
+        self.box_predictors = box_predictors
+        self.mask_roi_pool = mask_roi_pool
+        self.mask_head = mask_head
+        self.mask_predictor = mask_predictor
+
+        self.num_classes = num_classes
+        self.score_thresh = score_thresh
+        self.nms_thresh = nms_thresh
+        self.detections_per_img = detections_per_img
+
+        self.box_coder = BoxCoder(weights=bbox_reg_weights)
+        self.fg_bg_sampler = BalancedPositiveNegativeSampler(
+            batch_size_per_image, positive_fraction
+        )
+        # Matcher is not an nn.Module — just store as Python list
+        self._cascade_matchers: List[Matcher] = [
+            Matcher(iou_thr, iou_thr - 0.1, allow_low_quality_matches=False)
+            for iou_thr in self.CASCADE_IOUS
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _assign(
+        self,
+        proposals: List[torch.Tensor],
+        targets: List[Dict[str, torch.Tensor]],
+        matcher: Matcher,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """Return (matched_idxs, labels, regression_targets) per image."""
+        matched_idxs_list, labels_list, reg_list = [], [], []
+
+        for props, tgt in zip(proposals, targets):
+            gt_boxes = tgt["boxes"]
+            gt_labels = tgt["labels"]
+            device = props.device
+            N = props.shape[0]
+
+            if gt_boxes.numel() == 0:
+                matched_idxs_list.append(torch.zeros(N, dtype=torch.int64, device=device))
+                labels_list.append(torch.zeros(N, dtype=torch.int64, device=device))
+                reg_list.append(torch.zeros((N, 4), device=device))
+                continue
+
+            iou_mat = box_iou(gt_boxes, props)        # [num_gt, N]
+            matched = matcher(iou_mat)                 # [N]
+            clamped = matched.clamp(min=0)
+
+            lbls = gt_labels[clamped].to(torch.int64)
+            lbls[matched == Matcher.BELOW_LOW_THRESHOLD] = 0    # background
+            lbls[matched == Matcher.BETWEEN_THRESHOLDS] = -1  # ignore
+
+            reg = self.box_coder.encode([gt_boxes[clamped]], [props])[0]  # [N, 4]
+
+            matched_idxs_list.append(clamped)
+            labels_list.append(lbls)
+            reg_list.append(reg)
+
+        return matched_idxs_list, labels_list, reg_list
+
+    def _refine(
+        self,
+        box_regression: torch.Tensor,     # [N_total, num_classes * 4]
+        proposals: List[torch.Tensor],
+        image_shapes: List[Tuple[int, int]],
+    ) -> List[torch.Tensor]:
+        """Decode regression deltas → refined proposals (avg over fg classes)."""
+        decoded = self.box_coder.decode(box_regression, list(proposals))  # [N_total, C*4]
+        N = sum(len(p) for p in proposals)
+        decoded = decoded.view(N, self.num_classes, 4)            # [N_total, C, 4]
+        refined = decoded[:, 1:, :].mean(dim=1)                   # [N_total, 4]  avg fg
+
+        new_props = []
+        for r, shape in zip(refined.split([len(p) for p in proposals]), image_shapes):
+            new_props.append(clip_boxes_to_image(r.detach(), shape))
+        return new_props
+
+    # ------------------------------------------------------------------ #
+    # Forward                                                              #
+    # ------------------------------------------------------------------ #
+
+    def forward(
+        self,
+        features: Dict[str, torch.Tensor],
+        proposals: List[torch.Tensor],
+        image_shapes: List[Tuple[int, int]],
+        targets: Optional[List[Dict[str, torch.Tensor]]] = None,
+    ) -> Tuple[List[Dict], Dict[str, torch.Tensor]]:
+        if self.training:
+            assert targets is not None
+            return self._train(features, proposals, image_shapes, targets)
+        return self._eval(features, proposals, image_shapes)
+
+    # ------------------------------------------------------------------ #
+    # Training pass                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _train(self, features, proposals, image_shapes, targets):
+        losses: Dict[str, torch.Tensor] = {}
+        cur_props = [p.detach() for p in proposals]
+
+        last_pos_props: Optional[List[torch.Tensor]] = None
+        last_matched_idxs: Optional[List[torch.Tensor]] = None
+
+        for s, (matcher, bh, bp) in enumerate(
+            zip(self._cascade_matchers, self.box_heads, self.box_predictors)
+        ):
+            # 1. Assign GT with stage-specific IoU threshold
+            matched_idxs, labels, reg_targets = self._assign(cur_props, targets, matcher)
+
+            # 2. Sample balanced pos/neg
+            pos_idxs, neg_idxs = self.fg_bg_sampler(labels)
+
+            # 3. Pool ALL current proposals (reuse for refinement step 6)
+            box_feats = self.box_roi_pool(features, cur_props, image_shapes)
+            box_feats = bh(box_feats)
+            all_cls_logits, all_box_reg = bp(box_feats)
+
+            # 4. Select sampled subset for loss
+            props_per = [len(p) for p in cur_props]
+            offset = 0
+            sampled_cls, sampled_box, sampled_lbl, sampled_reg = [], [], [], []
+            for i, (pi, ni) in enumerate(zip(pos_idxs, neg_idxs)):
+                keep_i = (pi | ni).nonzero(as_tuple=False).squeeze(1)
+                g = keep_i + offset
+                sampled_cls.append(all_cls_logits[g])
+                sampled_box.append(all_box_reg[g])
+                sampled_lbl.append(labels[i][keep_i])
+                sampled_reg.append(reg_targets[i][keep_i])
+                offset += props_per[i]
+
+            loss_cls, loss_box = fastrcnn_loss(
+                torch.cat(sampled_cls), torch.cat(sampled_box),
+                sampled_lbl, sampled_reg,
+            )
+            losses[f"loss_classifier_s{s}"] = loss_cls
+            losses[f"loss_box_reg_s{s}"] = loss_box
+
+            # 5. Save final-stage positives for mask head
+            if s == len(self.CASCADE_IOUS) - 1:
+                # Use stage-2 REFINED boxes (output) for mask RoI, not input proposals
+                refined_for_mask = self._refine(all_box_reg.detach(), cur_props, image_shapes)
+                last_pos_props, last_matched_idxs = [], []
+                for i, (pi, mi) in enumerate(zip(pos_idxs, matched_idxs)):
+                    pos_i = pi.nonzero(as_tuple=False).squeeze(1)
+                    last_pos_props.append(refined_for_mask[i][pos_i])
+                    last_matched_idxs.append(mi[pos_i])
+
+            # 6. Refine proposals for next stage
+            if s < len(self.CASCADE_IOUS) - 1:
+                cur_props = self._refine(all_box_reg.detach(), cur_props, image_shapes)
+
+        # Mask head on final-stage positive proposals
+        if (
+            self.mask_roi_pool is not None
+            and last_pos_props is not None
+            and any(p.shape[0] > 0 for p in last_pos_props)
+        ):
+            gt_masks = [t["masks"] for t in targets]
+            gt_labels = [t["labels"] for t in targets]
+            mf = self.mask_roi_pool(features, last_pos_props, image_shapes)
+            mf = self.mask_head(mf)
+            mask_logits = self.mask_predictor(mf)
+            losses["loss_mask"] = maskrcnn_loss(
+                mask_logits, last_pos_props, gt_masks, gt_labels, last_matched_idxs
+            )
+
+        return [{} for _ in proposals], losses
+
+    # ------------------------------------------------------------------ #
+    # Inference pass                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _eval(self, features, proposals, image_shapes):
+        all_cls: List[torch.Tensor] = []
+        cur_props = proposals
+        final_box_reg: Optional[torch.Tensor] = None
+
+        for s, (bh, bp) in enumerate(zip(self.box_heads, self.box_predictors)):
+            bf = self.box_roi_pool(features, cur_props, image_shapes)
+            bf = bh(bf)
+            cls_logits, box_reg = bp(bf)
+            all_cls.append(cls_logits)
+            final_box_reg = box_reg
+            if s < len(self.CASCADE_IOUS) - 1:
+                cur_props = self._refine(box_reg, cur_props, image_shapes)
+
+        det_boxes, det_scores, det_labels = self._postprocess(
+            all_cls, final_box_reg, cur_props, image_shapes
+        )
+
+        # Mask head
+        result = []
+        device = final_box_reg.device
+        empty_mask = torch.zeros(
+            (0, 1, config.MASK_ROI_OUTPUT_SIZE, config.MASK_ROI_OUTPUT_SIZE), device=device
+        )
+
+        if self.mask_roi_pool is not None and sum(b.shape[0] for b in det_boxes) > 0:
+            mf = self.mask_roi_pool(features, det_boxes, image_shapes)
+            mf = self.mask_head(mf)
+            mask_logits = self.mask_predictor(mf)  # [total, C, H, W]
+
+            dets_per = [b.shape[0] for b in det_boxes]
+            offset = 0
+            for b, s_scores, lbls, n in zip(det_boxes, det_scores, det_labels, dets_per):
+                ml = mask_logits[offset: offset + n]          # [n, C, H, W]
+                idx = torch.arange(n, device=device)
+                sel = ml.sigmoid()[idx, lbls.long()]           # [n, H, W]
+                result.append({
+                    "boxes": b, "scores": s_scores, "labels": lbls,
+                    "masks": sel.unsqueeze(1),                 # [n, 1, H, W]
+                })
+                offset += n
+        else:
+            for b, s_scores, lbls in zip(det_boxes, det_scores, det_labels):
+                result.append({
+                    "boxes": b, "scores": s_scores, "labels": lbls,
+                    "masks": empty_mask[:b.shape[0]],
+                })
+
+        return result, {}
+
+    def _postprocess(
+        self,
+        all_cls_logits: List[torch.Tensor],
+        box_regression: torch.Tensor,
+        proposals: List[torch.Tensor],
+        image_shapes: List[Tuple[int, int]],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """Average ensemble scores, decode final boxes, batched NMS."""
+        device = box_regression.device
+
+        # Ensemble: average softmax across stages → [N_total, num_classes]
+        avg_scores = torch.stack(
+            [F.softmax(lg, dim=-1) for lg in all_cls_logits], dim=0
+        ).mean(0)
+
+        # Decode final-stage boxes → [N_total, C, 4]
+        pred_boxes = self.box_coder.decode(box_regression, list(proposals))  # [N_total, C*4]
+        pred_boxes = pred_boxes.view(-1, self.num_classes, 4)             # [N_total, C, 4]
+
+        props_per = [len(p) for p in proposals]
+        boxes_split = pred_boxes.split(props_per, dim=0)
+        scores_split = avg_scores.split(props_per, dim=0)
+
+        all_boxes, all_scores, all_labels = [], [], []
+
+        for pb, sc, img_shape in zip(boxes_split, scores_split, image_shapes):
+            img_b, img_s, img_l = [], [], []
+            for c in range(1, self.num_classes):
+                sc_c = sc[:, c]
+                bc = clip_boxes_to_image(pb[:, c, :], img_shape)
+                keep = sc_c > self.score_thresh
+                if not keep.any():
+                    continue
+                img_b.append(bc[keep])
+                img_s.append(sc_c[keep])
+                img_l.append(torch.full((keep.sum(),), c, dtype=torch.int64, device=device))
+
+            if img_b:
+                ib = torch.cat(img_b)
+                is_ = torch.cat(img_s)
+                il = torch.cat(img_l)
+                keep = batched_nms(ib, is_, il, self.nms_thresh)
+                keep = keep[:self.detections_per_img]
+                all_boxes.append(ib[keep])
+                all_scores.append(is_[keep])
+                all_labels.append(il[keep])
+            else:
+                all_boxes.append(torch.zeros((0, 4), device=device))
+                all_scores.append(torch.zeros(0, device=device))
+                all_labels.append(torch.zeros(0, dtype=torch.int64, device=device))
+
+        return all_boxes, all_scores, all_labels
 
 
 # ---------------------------------------------------------------------------
@@ -50,314 +436,100 @@ NUM_CLASSES = 4  # foreground classes; the model adds 1 for the "no-object" cls
 # ---------------------------------------------------------------------------
 
 
-def build_mask2former(
-    pretrained: bool = True,
-    num_classes: int = NUM_CLASSES,
-    num_queries: int = 100,
-) -> Mask2FormerForUniversalSegmentation:
+def build_maskrcnn(
+    pretrained_backbone: bool = True,
+    multi_scale: bool = True,
+) -> MaskRCNN:
     """
-    Instantiate a Mask2Former with a ConvNeXt-Base backbone.
-
-    The full architecture is **always built from scratch** (no COCO weights).
-    When ``pretrained=True``, only the ConvNeXt-Base backbone is loaded with
-    ImageNet-1K weights from ``facebook/convnext-base-224``.
-    The Pixel Decoder, Transformer Decoder, and all heads remain randomly
-    initialised.
-
-    Args:
-        pretrained:  If True, load ImageNet-1K backbone weights (permitted).
-                     If False, fully random initialisation.
-        num_classes: Number of *foreground* classes.
-        num_queries: Number of object queries.
-
-    Returns:
-        model: ready-to-train ``Mask2FormerForUniversalSegmentation``.
+    Build Mask R-CNN with ConvNeXt+FPN backbone, larger mask head,
+    and (optional) multi-scale training resolution.
     """
-    m2f_config = _build_config(
-        num_classes=num_classes, num_queries=num_queries
-    )
-    model = Mask2FormerForUniversalSegmentation(m2f_config)
+    _ = pretrained_backbone  # always loaded inside backbone factory
+    backbone = ConvNeXtFPNBackbone()
 
-    if pretrained:
-        _load_imagenet_backbone(model)
-
-    _patch_mask_decoder(model)
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(
-        f"[model] trainable parameters: {n_params / 1e6:.1f} M  "
-        f"(limit: 200 M)"
-    )
-    assert n_params < 200e6, (
-        f"Model has {n_params / 1e6:.1f} M params – exceeds 200 M cap!"
+    anchor_generator = AnchorGenerator(
+        sizes=config.RPN_ANCHOR_SIZES,
+        aspect_ratios=config.RPN_ASPECT_RATIOS,
     )
 
+    # Higher-resolution mask RoIAlign for sharper boundaries
+    mask_roi_pool = MultiScaleRoIAlign(
+        featmap_names=["0", "1", "2", "3"],
+        output_size=config.MASK_ROI_OUTPUT_SIZE,
+        sampling_ratio=2,
+    )
+
+    if multi_scale:
+        min_size = config.MULTI_SCALE_MIN_SIZES
+        max_size = config.MULTI_SCALE_MAX_SIZE
+    else:
+        min_size = config.INFERENCE_MIN_SIZE
+        max_size = config.INFERENCE_MAX_SIZE
+
+    model = MaskRCNN(
+        backbone=backbone,
+        num_classes=config.NUM_CLASSES_WITH_BG,
+        rpn_anchor_generator=anchor_generator,
+        box_detections_per_img=config.BOX_DETECTIONS_PER_IMG,
+        min_size=min_size,
+        max_size=max_size,
+        mask_roi_pool=mask_roi_pool,
+    )
     return model
 
 
-def _patch_mask_decoder(
-    model: Mask2FormerForUniversalSegmentation,
-) -> None:
-    """
-    Patch the decoder to rebuild the masked-attention map for the current
-    feature level right before each cross-attention call.
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    Some transformers builds only officially support Swin backbones for
-    Mask2Former. With ConvNeXt, the stock decoder can end up feeding an
-    attention mask sized for the next feature level into the current level's
-    cross-attention, which triggers a source-length mismatch on rectangular
-    images.
 
-    This patch keeps the architecture unchanged and only makes the decoder's
-    mask scheduling explicit: for decoder layer ``idx``, the cross-attention
-    mask is always generated with ``feature_size_list[idx % num_feature_levels]``.
+def build_cascade_maskrcnn(
+    pretrained_backbone: bool = True,
+    multi_scale: bool = True,
+) -> nn.Module:
     """
-    from transformers.models.mask2former.modeling_mask2former import (
-        Mask2FormerMaskedAttentionDecoderOutput,
+    Build Cascade Mask R-CNN with ConvNeXt-V2-Base + FPN backbone.
+
+    Replaces the standard torchvision RoIHeads with 3-stage CascadeRoIHeads
+    (IoU thresholds 0.5 → 0.6 → 0.7).
+
+    Parameter budget:
+        Standard Mask R-CNN  ≈ 107 M
+        + 2 extra box stages ≈  26 M  (TwoMLPHead + FastRCNNPredictor × 2)
+        Cascade total        ≈ 133 M  → well under the 200 M limit
+    """
+    base = build_maskrcnn(pretrained_backbone=pretrained_backbone, multi_scale=multi_scale)
+    rh = base.roi_heads
+
+    # Three cascade stages: stage 0 reuses existing heads; 1 and 2 are deep-copies
+    box_heads = nn.ModuleList([
+        rh.box_head,
+        copy.deepcopy(rh.box_head),
+        copy.deepcopy(rh.box_head),
+    ])
+    box_predictors = nn.ModuleList([
+        rh.box_predictor,
+        copy.deepcopy(rh.box_predictor),
+        copy.deepcopy(rh.box_predictor),
+    ])
+
+    base.roi_heads = CascadeRoIHeads(
+        box_roi_pool=rh.box_roi_pool,
+        box_heads=box_heads,
+        box_predictors=box_predictors,
+        num_classes=config.NUM_CLASSES_WITH_BG,
+        batch_size_per_image=512,
+        positive_fraction=0.25,
+        score_thresh=0.05,
+        nms_thresh=0.5,
+        detections_per_img=config.BOX_DETECTIONS_PER_IMG,
+        mask_roi_pool=rh.mask_roi_pool,
+        mask_head=rh.mask_head,
+        mask_predictor=rh.mask_predictor,
     )
-
-    decoder = model.model.transformer_module.decoder
-
-    def _forward_patched(
-        self,
-        inputs_embeds: torch.Tensor,
-        multi_stage_positional_embeddings: list,
-        pixel_embeddings: torch.Tensor,
-        encoder_hidden_states: list,
-        query_position_embeddings: Optional[torch.Tensor] = None,
-        feature_size_list: Optional[list] = None,
-        output_hidden_states: bool = False,
-        output_attentions: bool = False,
-        return_dict: bool = True,
-    ):
-        hidden_states = inputs_embeds
-        all_hidden_states = () if output_hidden_states else None
-        intermediate = ()
-        attentions = () if output_attentions else None
-        intermediate_mask_predictions = ()
-
-        intermediate_hidden_states = self.layernorm(inputs_embeds)
-        intermediate += (intermediate_hidden_states,)
-
-        predicted_mask, _ = self.mask_predictor(
-            intermediate_hidden_states,
-            pixel_embeddings,
-            feature_size_list[0],
-        )
-        intermediate_mask_predictions += (predicted_mask,)
-
-        for idx, decoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            dropout_probability = torch.rand([])
-            if self.training and (dropout_probability < self.layerdrop):
-                continue
-
-            level_index = idx % self.num_feature_levels
-            _, attention_mask = self.mask_predictor(
-                intermediate_hidden_states,
-                pixel_embeddings,
-                feature_size_list[level_index],
-            )
-
-            where = (attention_mask.sum(-1) != attention_mask.shape[-1]).to(
-                attention_mask.dtype
-            )
-            attention_mask = attention_mask * where.unsqueeze(-1)
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                level_index,
-                None,
-                multi_stage_positional_embeddings,
-                query_position_embeddings,
-                encoder_hidden_states,
-                encoder_attention_mask=attention_mask,
-                output_attentions=output_attentions,
-            )
-
-            intermediate_hidden_states = self.layernorm(layer_outputs[0])
-            predicted_mask, _ = self.mask_predictor(
-                intermediate_hidden_states,
-                pixel_embeddings,
-                feature_size_list[(idx + 1) % self.num_feature_levels],
-            )
-            intermediate_mask_predictions += (predicted_mask,)
-            intermediate += (intermediate_hidden_states,)
-            hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                attentions += (layer_outputs[1],)
-
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        hidden_states = hidden_states.transpose(1, 0)
-        if not return_dict:
-            outputs = [
-                hidden_states,
-                all_hidden_states,
-                attentions,
-                intermediate,
-                intermediate_mask_predictions,
-            ]
-            return tuple(v for v in outputs if v is not None)
-
-        return Mask2FormerMaskedAttentionDecoderOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=attentions,
-            intermediate_hidden_states=intermediate,
-            masks_queries_logits=intermediate_mask_predictions,
-        )
-
-    decoder.forward = MethodType(_forward_patched, decoder)
+    return base
 
 
-def _load_imagenet_backbone(
-    model: Mask2FormerForUniversalSegmentation,
-) -> None:
-    """
-    Copy ImageNet-1K pretrained ConvNeXt-V2 (or V1) weights into the backbone.
-
-    The backbone model id is read from ``config.BACKBONE``
-    (e.g. ``"convnextv2-base-1k-224"`` → ``facebook/convnextv2-base-1k-224``).
-    """
-    import config
-    from transformers import ConvNextV2Model, ConvNextModel
-
-    backbone_id = getattr(config, "BACKBONE", "convnextv2-base-1k-224")
-    hf_id = f"facebook/{backbone_id}"
-    use_v2 = "convnextv2" in backbone_id
-
-    print(f"[model] loading ImageNet-1K backbone: {hf_id}")
-    if use_v2:
-        imagenet_convnext = ConvNextV2Model.from_pretrained(hf_id, use_safetensors=True)
-    else:
-        imagenet_convnext = ConvNextModel.from_pretrained(hf_id, use_safetensors=True)
-
-    backbone = model.model.pixel_level_module.encoder
-
-    # strict=False: skips pooler / classifier keys absent in Mask2Former.
-    missing, unexpected = backbone.load_state_dict(
-        imagenet_convnext.state_dict(), strict=False
-    )
-
-    n_loaded = len(imagenet_convnext.state_dict()) - len(unexpected)
-    print(f"[model] backbone weights loaded: {n_loaded} tensors")
-    del imagenet_convnext  # free memory immediately
-
-
-def _build_config(
-    num_classes: int,
-    num_queries: int,
-) -> Mask2FormerConfig:
-    """Build a from-scratch Mask2Former config driven by config.py."""
-    import config
-    from transformers import ConvNextV2Config, ConvNextConfig
-
-    backbone_id = getattr(config, "BACKBONE", "convnextv2-base-1k-224")
-    use_v2 = "convnextv2" in backbone_id
-
-    if use_v2:
-        backbone_config = ConvNextV2Config(
-            num_channels=3,
-            depths=config.BACKBONE_DEPTHS,
-            hidden_sizes=config.BACKBONE_HIDDEN_SIZES,
-            drop_path_rate=config.BACKBONE_DROP_PATH,
-            out_features=["stage1", "stage2", "stage3", "stage4"],
-        )
-    else:
-        backbone_config = ConvNextConfig(
-            num_channels=3,
-            depths=config.BACKBONE_DEPTHS,
-            hidden_sizes=config.BACKBONE_HIDDEN_SIZES,
-            drop_path_rate=config.BACKBONE_DROP_PATH,
-            out_features=["stage1", "stage2", "stage3", "stage4"],
-        )
-
-    config_ = Mask2FormerConfig(
-        backbone_config=backbone_config,
-        num_labels=num_classes,
-        num_queries=num_queries,
-        feature_size=config.DECODER_FEATURE_SIZE,
-        mask_feature_size=config.DECODER_MASK_FEATURE_SIZE,
-        hidden_dim=config.DECODER_HIDDEN_DIM,
-        encoder_layers=config.DECODER_ENCODER_LAYERS,
-        decoder_layers=config.DECODER_DECODER_LAYERS,
-        num_attention_heads=config.DECODER_ATTENTION_HEADS,
-        dropout=config.DECODER_DROPOUT,
-        dim_feedforward=config.DECODER_DIM_FEEDFORWARD,
-        pre_norm=False,
-        enforce_input_projection=False,
-        common_stride=4,
-    )
-    return config_
-
-
-# ---------------------------------------------------------------------------
-# Lightweight wrapper (optional) – freezes backbone early in training
-# ---------------------------------------------------------------------------
-
-
-class Mask2FormerWrapper(nn.Module):
-    """
-    Thin wrapper around the HF model that exposes
-    ``freeze_backbone`` / ``unfreeze_backbone`` helpers.
-    """
-
-    def __init__(
-        self,
-        pretrained: bool = True,
-        num_classes: int = NUM_CLASSES,
-        num_queries: int = 100,
-    ) -> None:
-        super().__init__()
-        self.model = build_mask2former(
-            pretrained=pretrained,
-            num_classes=num_classes,
-            num_queries=num_queries,
-        )
-
-    # ------------------------------------------------------------------
-
-    def freeze_backbone(self) -> None:
-        """Freeze ConvNeXt-Base backbone weights (warm-up phase)."""
-        for param in self.model.model.pixel_level_module.encoder.parameters():
-            param.requires_grad = False
-
-    def unfreeze_backbone(self) -> None:
-        """Unfreeze ConvNeXt-Base backbone for full fine-tuning."""
-
-        for param in self.model.model.pixel_level_module.encoder.parameters():
-            param.requires_grad = True
-
-    # ------------------------------------------------------------------
-
-    def forward(
-        self,
-        pixel_values: torch.Tensor,
-        mask_labels: Optional[list] = None,
-        class_labels: Optional[list] = None,
-    ) -> Dict:
-        """
-        Args:
-            pixel_values:  (B, 3, H, W).
-            mask_labels:   list of (N_i, H, W) float tensors per image
-                           (required for training).
-            class_labels:  list of (N_i,) int64 tensors per image
-                           (required for training).
-
-        Returns:
-            HF ``Mask2FormerForUniversalSegmentationOutput`` (dict-like).
-            During training this contains ``loss`` and its components.
-            During inference it contains ``masks_queries_logits`` and
-            ``class_queries_logits``.
-        """
-        outputs = self.model(
-            pixel_values=pixel_values,
-            mask_labels=mask_labels,
-            class_labels=class_labels,
-        )
-        return outputs
+if __name__ == "__main__":
+    m = build_cascade_maskrcnn(pretrained_backbone=False)
+    n = count_parameters(m)
+    print(f"Cascade Mask R-CNN params: {n / 1e6:.2f} M  (limit 200 M)")

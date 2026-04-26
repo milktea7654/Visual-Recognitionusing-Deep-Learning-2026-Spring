@@ -1,20 +1,22 @@
 """
-dataset.py – PyTorch Dataset for HW3 medical cell instance segmentation.
+dataset.py – Cell instance segmentation dataset with heavy augmentation.
 
-Directory layout expected:
-    data/train/<uuid>/image.tif          – RGB or greyscale image
-    data/train/<uuid>/class{1,2,3,4}.tif – instance mask (uint16 / uint8);
-                                           each unique non-zero pixel value
-                                           is one instance.
-    data/test_release/<uuid>.tif         – test images (no masks)
+Augmentations:
+  * Random crop / pad to CROP_SIZE (preserves native scale of small images;
+    random patch from large images).
+  * Albumentations heavy aug (rotate/flip/colour/elastic/noise) when training.
+  * Copy-paste augmentation: paste random instances from other train images
+    into background regions.
 
-Each class mask file is optional; a folder may have only a subset of classes.
+Returns torchvision-format detection target dict:
+    {boxes, labels, masks, image_id, area, iscrowd}
 """
 
-import math
+from __future__ import annotations
+
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import tifffile
@@ -22,181 +24,74 @@ import torch
 import torch.nn.functional as F
 import torch.utils.data as data
 import torchvision.transforms.functional as TF
-from torchvision.transforms import InterpolationMode
-from PIL import Image
+from torchvision.ops import masks_to_boxes
 
+import config
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+try:
+    import albumentations as A
+    _HAS_ALB = True
+except ImportError:
+    _HAS_ALB = False
+
 
 CLASS_NAMES = ["class1", "class2", "class3", "class4"]
-NUM_CLASSES = 4  # foreground classes; index 0 = background internally
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# I/O
 # ---------------------------------------------------------------------------
 
 
-def _load_tif(path: str) -> np.ndarray:
-    """
-    Load a .tif file and return a NumPy array (H, W) or (H, W, C).
-
-    Uses ``tifffile`` instead of PIL to handle scientific/medical TIFF
-    variants (LZW compression, BigTIFF, multi-page, uint16, etc.).
-    Multi-page TIFFs are squeezed to the first page.
-    """
-    arr = tifffile.imread(path)
-    # tifffile may return (pages, H, W) for multi-page TIFFs – take page 0.
+def _load_image_tif(path: Path) -> np.ndarray:
+    """Load a TIFF as uint8 (H, W, 3) RGB array."""
+    arr = tifffile.imread(str(path))
     if arr.ndim == 3 and arr.shape[0] < arr.shape[1] and arr.shape[0] < arr.shape[2]:
         arr = arr[0]
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi > lo:
+            arr = (arr - lo) / (hi - lo) * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]
     return arr
 
 
-def _parse_instance_mask(
-    mask_arr: np.ndarray,
-) -> Tuple[List[np.ndarray], List[int]]:
-    """
-    Convert a single-channel instance mask into per-instance binary masks.
-
-    Uses PyTorch tensor broadcasting (backed by C++ multi-threading) which
-    is faster than pure NumPy for large arrays with many instances.
-
-    Args:
-        mask_arr: (H, W) integer array where each unique non-zero value is
-                  one cell instance.
-
-    Returns:
-        masks: list of boolean (H, W) arrays, one per instance.
-        instance_ids: the original pixel values (for debugging).
-    """
-    instance_ids = np.unique(mask_arr)
-    instance_ids = instance_ids[instance_ids != 0]
-    if len(instance_ids) == 0:
-        return [], instance_ids.tolist()
-    mask_tensor = torch.from_numpy(mask_arr)
-    ids_tensor = torch.from_numpy(instance_ids)
-    # (N, H, W) bool – single broadcast op via PyTorch C++ backend
-    masks_bool = mask_tensor.unsqueeze(0) == ids_tensor.unsqueeze(1).unsqueeze(2)
-    return list(masks_bool.numpy()), instance_ids.tolist()
-
-
-def _to_rgb_tensor(img_arr: np.ndarray) -> torch.Tensor:
-    """
-    Convert a NumPy image (H, W) or (H, W, C) to a float32 (3, H, W) tensor
-    normalised to [0, 1].
-    """
-    if img_arr.ndim == 2:
-        img_arr = np.stack([img_arr] * 3, axis=-1)
-    elif img_arr.shape[2] == 1:
-        img_arr = np.concatenate([img_arr] * 3, axis=-1)
-    elif img_arr.shape[2] > 3:
-        img_arr = img_arr[:, :, :3]
-
-    # Normalise to [0, 1] regardless of bit-depth (8-bit or 16-bit TIFFs).
-    if np.issubdtype(img_arr.dtype, np.integer):
-        max_val = float(np.iinfo(img_arr.dtype).max)
-    else:
-        max_val = float(img_arr.max()) if img_arr.max() > 0 else 1.0
-    img_arr = img_arr.astype(np.float32) / max_val
-    tensor = torch.from_numpy(img_arr).permute(2, 0, 1)  # (3, H, W)
-    return tensor
+def _load_mask_tif(path: Path) -> np.ndarray:
+    arr = tifffile.imread(str(path))
+    if arr.ndim == 3 and arr.shape[0] < arr.shape[1] and arr.shape[0] < arr.shape[2]:
+        arr = arr[0]
+    return arr.astype(np.int32)
 
 
 # ---------------------------------------------------------------------------
-# Augmentation helpers (geometry-consistent on image + masks)
+# Albumentations pipeline (operates on numpy + masks list)
 # ---------------------------------------------------------------------------
 
 
-def _random_horizontal_flip(
-    image: torch.Tensor,
-    masks: Optional[torch.Tensor],
-    p: float = 0.5,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if random.random() < p:
-        image = TF.hflip(image)
-        if masks is not None:
-            masks = torch.flip(masks, dims=[-1])
-    return image, masks
-
-
-def _random_vertical_flip(
-    image: torch.Tensor,
-    masks: Optional[torch.Tensor],
-    p: float = 0.5,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if random.random() < p:
-        image = TF.vflip(image)
-        if masks is not None:
-            masks = torch.flip(masks, dims=[-2])
-    return image, masks
-
-
-def _random_crop(
-    image: torch.Tensor,
-    masks: Optional[torch.Tensor],
-    min_scale: float = 0.7,
-    max_scale: float = 1.0,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Random crop with scale in [min_scale, max_scale] of the original size,
-    then resize back to original dimensions.  Keeps all masks aligned.
-    """
-    _, h, w = image.shape
-    scale = random.uniform(min_scale, max_scale)
-    ch = int(h * scale)
-    cw = int(w * scale)
-    top = random.randint(0, h - ch)
-    left = random.randint(0, w - cw)
-
-    image = TF.crop(image, top, left, ch, cw)
-    image = TF.resize(image, [h, w], antialias=True)
-
-    if masks is not None and masks.shape[0] > 0:
-        masks = TF.crop(masks, top, left, ch, cw)
-        # Use nearest neighbor to preserve integer instance IDs
-        masks = TF.resize(
-            masks.unsqueeze(1).float(),
-            [h, w],
-            interpolation=InterpolationMode.NEAREST,
-        ).squeeze(1).to(masks.dtype)
-
-    return image, masks
-
-
-def _color_jitter(
-    image: torch.Tensor,
-    brightness: float = 0.3,
-    contrast: float = 0.3,
-    saturation: float = 0.2,
-    hue: float = 0.05,
-) -> torch.Tensor:
-    """Apply colour jitter to the image tensor only."""
-    from torchvision import transforms as T
-
-    jitter = T.ColorJitter(
-        brightness=brightness,
-        contrast=contrast,
-        saturation=saturation,
-        hue=hue,
-    )
-    return jitter(image)
-
-
-def _gaussian_blur(image: torch.Tensor, p: float = 0.2) -> torch.Tensor:
-    if random.random() < p:
-        sigma = random.uniform(0.1, 1.5)
-        image = TF.gaussian_blur(image, kernel_size=5, sigma=sigma)
-    return image
-
-
-def _normalize(image: torch.Tensor) -> torch.Tensor:
-    """ImageNet mean/std normalisation."""
-    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
-    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
-    image = (image - mean[:, None, None]) / std[:, None, None]
-    return image
+def _build_alb_pipeline() -> "A.Compose":
+    return A.Compose([
+        A.RandomRotate90(p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.Transpose(p=0.5),
+        A.ShiftScaleRotate(
+            shift_limit=0.0625, scale_limit=0.2, rotate_limit=45,
+            border_mode=0, p=0.7,
+        ),
+        A.RandomBrightnessContrast(
+            brightness_limit=0.2, contrast_limit=0.2, p=0.5,
+        ),
+        A.HueSaturationValue(
+            hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.3,
+        ),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
+        A.ElasticTransform(alpha=1, sigma=50, p=0.2),
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -205,308 +100,273 @@ def _normalize(image: torch.Tensor) -> torch.Tensor:
 
 
 class CellInstanceDataset(data.Dataset):
-    """
-    Loads medical cell images and their instance segmentation masks.
-
-    Args:
-        root_dir:         Path to ``data/train``.
-        augment:          Apply training augmentations when True.
-        crop_size:        If image is larger than this, randomly crop to
-                          ``crop_size × crop_size`` (never resize down).
-                          For images smaller than crop_size, pad up to the
-                          nearest size_divisibility multiple instead.
-        size_divisibility: Pad dims to be a multiple of this (32 for ConvNeXt).
-        min_size:         Minimum output dim; small images padded to this.
-    """
+    """Cell instance-segmentation dataset compatible with torchvision MaskRCNN."""
 
     def __init__(
         self,
-        root_dir: str,
-        augment: bool = True,
-        crop_size: Optional[int] = 768,
-        size_divisibility: int = 32,
-        min_size: Optional[int] = 256,
-        # Legacy aliases (ignored; kept for call-site compatibility)
-        max_size: Optional[int] = None,
+        root: str,
+        sample_ids: List[str],
+        train: bool = True,
+        crop_size: int = config.CROP_SIZE,
     ) -> None:
-        self.root_dir = Path(root_dir)
-        self.augment = augment
+        self.root = Path(root)
+        self.sample_ids = list(sample_ids)
+        self.train = train
         self.crop_size = crop_size
-        self.size_divisibility = size_divisibility
-        self.min_size = min_size
-        # Legacy aliases
-        self.max_size = crop_size
 
-        self.sample_dirs: List[Path] = sorted(
-            [p for p in self.root_dir.iterdir() if p.is_dir()]
-        )
-        # In-memory tensor cache: key = folder name, value = (image, masks_stacked)
-        # First epoch reads from disk; subsequent epochs hit this dict (~0 ms I/O).
-        self.cache: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.use_alb = train and config.USE_ALBUMENTATIONS and _HAS_ALB
+        self.alb = _build_alb_pipeline() if self.use_alb else None
 
-    def __len__(self) -> int:
-        return len(self.sample_dirs)
+        self.use_copy_paste = train and config.USE_COPY_PASTE
 
-    # ------------------------------------------------------------------
-    # Internal loaders
-    # ------------------------------------------------------------------
+        # Pre-compute majority class per sample for class-balanced sampling
+        self._majority_class = self._compute_majority_classes()
 
-    def _load_sample(
-        self, sample_dir: Path
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            image:         (3, H, W) float32 tensor in [0, 1].
-            masks_stacked: (4, H, W) int32 tensor – raw instance IDs per class
-                           (class index = channel, 0 = background).
-        """
-        cache_key = sample_dir.name
-        if cache_key in self.cache:
-            # .clone() prevents augmentation from corrupting the cached tensors
-            img_c, msk_c = self.cache[cache_key]
-            return img_c.clone(), msk_c.clone()
+    # -------------------------------------------------------------------
+    # Sample loading
+    # -------------------------------------------------------------------
 
-        img_arr = _load_tif(str(sample_dir / "image.tif"))
-        image = _to_rgb_tensor(img_arr)
+    def _load_sample(self, sample_id: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        sample_dir = self.root / sample_id
+        img = _load_image_tif(sample_dir / "image.tif")
+        H, W = img.shape[:2]
 
-        _, h, w = image.shape
-        masks_stacked = torch.zeros((NUM_CLASSES, h, w), dtype=torch.int32)
-
-        for cls_idx, cls_name in enumerate(CLASS_NAMES):
-            mask_path = sample_dir / f"{cls_name}.tif"
-            if not mask_path.exists():
+        masks: List[np.ndarray] = []
+        labels: List[int] = []
+        for cls_idx, cls_name in enumerate(CLASS_NAMES, start=1):
+            mp = sample_dir / f"{cls_name}.tif"
+            if not mp.exists():
                 continue
-            mask_arr = _load_tif(str(mask_path))
-            masks_stacked[cls_idx] = torch.from_numpy(mask_arr.astype(np.int32))
-
-        # Write to cache after first load
-        self.cache[cache_key] = (image.clone(), masks_stacked.clone())
-        return image, masks_stacked
-
-    # ------------------------------------------------------------------
-    # Augmentation pipeline
-    # ------------------------------------------------------------------
-
-    def _augment(
-        self,
-        image: torch.Tensor,
-        masks_stacked: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        image, masks_stacked = _random_horizontal_flip(image, masks_stacked)
-        image, masks_stacked = _random_vertical_flip(image, masks_stacked)
-        image, masks_stacked = _random_crop(image, masks_stacked)
-        image = _color_jitter(image)
-        image = _gaussian_blur(image)
-        return image, masks_stacked
-
-    # ------------------------------------------------------------------
-    # Resize + pad / crop (golden path)
-    # ------------------------------------------------------------------
-
-    def _resize_and_pad(
-        self,
-        image: torch.Tensor,
-        masks_stacked: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sizing strategy:
-        • If image is LARGER than crop_size in either dimension:
-              Randomly crop a crop_size × crop_size window (no resize).
-              This preserves physical cell size so small cells are never
-              shrunk to sub-pixel features after the 32× stride.
-        • If image is SMALLER than crop_size:
-              Zero-pad to the nearest size_divisibility multiple ≥ min_size.
-        Operates on the compact (4, H, W) int32 stacked mask.
-        """
-        _, h, w = image.shape
-        d = self.size_divisibility
-
-        if self.crop_size is not None and (h > self.crop_size or w > self.crop_size):
-            # ---------- random crop path ----------
-            ch = min(h, self.crop_size)
-            cw = min(w, self.crop_size)
-            top  = random.randint(0, h - ch)
-            left = random.randint(0, w - cw)
-            image        = TF.crop(image,        top, left, ch, cw)
-            masks_stacked = TF.crop(masks_stacked, top, left, ch, cw)
-            h, w = ch, cw
-
-        # Pad to size_divisibility and min_size (no resize)
-        target_h = math.ceil(h / d) * d
-        target_w = math.ceil(w / d) * d
-        if self.min_size is not None:
-            target_h = max(target_h, self.min_size)
-            target_w = max(target_w, self.min_size)
-        pad_h = target_h - h
-        pad_w = target_w - w
-
-        if pad_h > 0 or pad_w > 0:
-            image         = F.pad(image,         (0, pad_w, 0, pad_h), value=0.0)
-            masks_stacked = F.pad(masks_stacked, (0, pad_w, 0, pad_h), value=0)
-
-        return image, masks_stacked
-
-    # ------------------------------------------------------------------
-    # __getitem__
-    # ------------------------------------------------------------------
-
-    def __getitem__(self, idx: int) -> Dict:
-        sample_dir = self.sample_dirs[idx]
-        image, masks_stacked = self._load_sample(sample_dir)
-
-        if self.augment:
-            image, masks_stacked = self._augment(image, masks_stacked)
-
-        image, masks_stacked = self._resize_and_pad(image, masks_stacked)
-        image = _normalize(image)
-
-        # --- Deferred unpacking: (4, H, W) int32 → (N, H, W) bool ---
-        # Only happens here, after all resize/augment ops are done.
-        all_bool_masks: List[torch.Tensor] = []
-        all_labels: List[int] = []
-        for cls_idx in range(NUM_CLASSES):
-            cls_mask = masks_stacked[cls_idx]          # (H, W) int32
-            inst_ids = cls_mask.unique()
+            mask_arr = _load_mask_tif(mp)
+            if mask_arr.shape != (H, W):
+                continue
+            inst_ids = np.unique(mask_arr)
             inst_ids = inst_ids[inst_ids != 0]
-            if len(inst_ids) > 0:
-                # (N, H, W) bool via vectorised comparison
-                bool_masks = cls_mask.unsqueeze(0) == inst_ids.unsqueeze(1).unsqueeze(2)
-                all_bool_masks.extend(list(bool_masks))
-                all_labels.extend([cls_idx + 1] * len(inst_ids))  # 1-indexed
+            for iid in inst_ids:
+                bin_mask = (mask_arr == iid).astype(np.uint8)
+                if bin_mask.sum() == 0:
+                    continue
+                masks.append(bin_mask)
+                labels.append(cls_idx)
 
-        if all_bool_masks:
-            masks_tensor = torch.stack(all_bool_masks)
-            labels_tensor = torch.tensor(all_labels, dtype=torch.long)
-        else:
-            _, h, w = image.shape
-            masks_tensor = torch.zeros((0, h, w), dtype=torch.bool)
-            labels_tensor = torch.zeros((0,), dtype=torch.long)
+        masks_arr = np.stack(masks, axis=0) if masks else np.zeros((0, H, W), np.uint8)
+        labels_arr = np.array(labels, dtype=np.int64)
+        return img, masks_arr, labels_arr
 
-        return {
-            "image": image,               # (3, H, W) float32, normalised
-            "masks": masks_tensor,        # (N, H, W) bool
-            "labels": labels_tensor,      # (N,) int64, 1-indexed class ids
-            "image_id": sample_dir.name,  # folder UUID string
-        }
+    def _compute_majority_classes(self) -> List[int]:
+        """For class-balanced sampling: dominant class id per sample."""
+        out: List[int] = []
+        for sid in self.sample_ids:
+            sample_dir = self.root / sid
+            counts = [0] * (config.NUM_CLASSES + 1)
+            for cls_idx, cls_name in enumerate(CLASS_NAMES, start=1):
+                if (sample_dir / f"{cls_name}.tif").exists():
+                    counts[cls_idx] += 1
+            out.append(int(np.argmax(counts)) if max(counts) > 0 else 1)
+        return out
 
+    @property
+    def majority_classes(self) -> List[int]:
+        return self._majority_class
 
-# ---------------------------------------------------------------------------
-# Test-set Dataset (no masks)
-# ---------------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Patch crop / pad
+    # -------------------------------------------------------------------
 
-
-class CellTestDataset(data.Dataset):
-    """
-    Loads test images from ``data/test_release/``.
-
-    Args:
-        root_dir:         Path to ``data/test_release``.
-        max_size:         Cap long edge (scale down only).
-        min_size:         Minimum dim; pad if smaller.
-        size_divisibility: Pad to multiple of this value.
-    """
-
-    def __init__(
+    def _crop_or_pad_np(
         self,
-        root_dir: str,
-        max_size: Optional[int] = 768,
-        min_size: Optional[int] = 256,
-        size_divisibility: int = 32,
-    ) -> None:
-        self.root_dir = Path(root_dir)
-        self.max_size = max_size
-        self.min_size = min_size
-        self.size_divisibility = size_divisibility
-        self.image_paths: List[Path] = sorted(self.root_dir.glob("*.tif"))
+        img: np.ndarray,        # (H, W, 3) uint8
+        masks: np.ndarray,      # (N, H, W) uint8
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        H, W = img.shape[:2]
+        cs = self.crop_size
+
+        pad_h = max(0, cs - H)
+        pad_w = max(0, cs - W)
+        if pad_h > 0 or pad_w > 0:
+            img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant")
+            if masks.shape[0] > 0:
+                masks = np.pad(masks, ((0, 0), (0, pad_h), (0, pad_w)), mode="constant")
+            else:
+                masks = np.zeros((0, H + pad_h, W + pad_w), np.uint8)
+            H, W = H + pad_h, W + pad_w
+
+        if H > cs or W > cs:
+            if self.train:
+                top = random.randint(0, H - cs)
+                left = random.randint(0, W - cs)
+            else:
+                top = (H - cs) // 2
+                left = (W - cs) // 2
+            img = img[top:top + cs, left:left + cs]
+            if masks.shape[0] > 0:
+                masks = masks[:, top:top + cs, left:left + cs]
+            else:
+                masks = np.zeros((0, cs, cs), np.uint8)
+
+        return img, masks
+
+    # -------------------------------------------------------------------
+    # Albumentations wrap
+    # -------------------------------------------------------------------
+
+    def _apply_alb(
+        self, img: np.ndarray, masks: np.ndarray, labels: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.use_alb or masks.shape[0] == 0:
+            return img, masks, labels
+        # Albumentations needs masks as list of (H, W)
+        masks_list = [m for m in masks]
+        out = self.alb(image=img, masks=masks_list)
+        img2 = out["image"]
+        masks2 = np.stack(out["masks"], axis=0).astype(np.uint8) if out["masks"] else np.zeros((0,) + img2.shape[:2], np.uint8)
+        return img2, masks2, labels
+
+    # -------------------------------------------------------------------
+    # Copy-paste aug
+    # -------------------------------------------------------------------
+
+    def _copy_paste(
+        self, img: np.ndarray, masks: np.ndarray, labels: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Paste up to N instances from another random sample.
+        Both source instance pixels and mask are pasted; label = source label.
+        """
+        if random.random() > config.COPY_PASTE_PROB:
+            return img, masks, labels
+
+        donor_id = random.choice(self.sample_ids)
+        d_img, d_masks, d_labels = self._load_sample(donor_id)
+        if d_masks.shape[0] == 0:
+            return img, masks, labels
+
+        d_img, d_masks = self._crop_or_pad_np(d_img, d_masks)
+        # filter empty masks after crop
+        keep = d_masks.reshape(d_masks.shape[0], -1).any(axis=1)
+        d_masks = d_masks[keep]
+        d_labels = d_labels[keep] if d_labels.shape[0] == keep.shape[0] else d_labels
+
+        if d_masks.shape[0] == 0:
+            return img, masks, labels
+
+        n_paste = random.randint(1, min(config.COPY_PASTE_MAX_OBJECTS, d_masks.shape[0]))
+        idx = np.random.choice(d_masks.shape[0], size=n_paste, replace=False)
+
+        new_masks = [m for m in masks]
+        new_labels = list(labels.tolist())
+        out_img = img.copy()
+
+        for i in idx:
+            m = d_masks[i].astype(bool)
+            if not m.any():
+                continue
+            out_img[m] = d_img[m]
+            new_masks.append(m.astype(np.uint8))
+            new_labels.append(int(d_labels[i]))
+
+        new_masks_arr = np.stack(new_masks, axis=0) if new_masks else np.zeros_like(masks)
+        new_labels_arr = np.array(new_labels, dtype=np.int64)
+
+        # Occlusion: subtract pasted pixels from earlier masks
+        if new_masks_arr.shape[0] > n_paste:
+            paste_union = np.zeros(out_img.shape[:2], bool)
+            for i in idx:
+                paste_union |= d_masks[i].astype(bool)
+            for j in range(new_masks_arr.shape[0] - n_paste):
+                new_masks_arr[j][paste_union] = 0
+
+        return out_img, new_masks_arr, new_labels_arr
+
+    # -------------------------------------------------------------------
+    # __getitem__
+    # -------------------------------------------------------------------
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        sample_id = self.sample_ids[idx]
+        img_np, masks_np, labels_np = self._load_sample(sample_id)
+
+        # patch crop/pad on numpy
+        img_np, masks_np = self._crop_or_pad_np(img_np, masks_np)
+
+        # filter empty masks after crop
+        if masks_np.shape[0] > 0:
+            keep = masks_np.reshape(masks_np.shape[0], -1).any(axis=1)
+            masks_np = masks_np[keep]
+            labels_np = labels_np[keep]
+
+        # copy-paste
+        if self.use_copy_paste:
+            img_np, masks_np, labels_np = self._copy_paste(img_np, masks_np, labels_np)
+
+        # albumentations heavy aug
+        img_np, masks_np, labels_np = self._apply_alb(img_np, masks_np, labels_np)
+
+        # to tensor
+        img = TF.to_tensor(img_np)                            # (3, H, W)
+        masks = torch.from_numpy(masks_np).to(torch.uint8)    # (N, H, W)
+        labels = torch.from_numpy(labels_np).to(torch.int64)
+
+        # filter empty / invalid instances
+        if masks.numel() > 0:
+            keep = masks.flatten(1).any(dim=1).bool()
+            masks = masks[keep]
+            labels = labels[keep]
+
+        if masks.shape[0] > 0:
+            boxes = masks_to_boxes(masks)
+            valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+            boxes = boxes[valid]
+            masks = masks[valid]
+            labels = labels[valid]
+        else:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+
+        area = (
+            (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            if boxes.numel() > 0 else torch.zeros((0,), dtype=torch.float32)
+        )
+        iscrowd = torch.zeros((boxes.shape[0],), dtype=torch.int64)
+
+        target = {
+            "boxes":    boxes,
+            "labels":   labels,
+            "masks":    masks,
+            "image_id": torch.tensor([idx], dtype=torch.int64),
+            "area":     area,
+            "iscrowd":  iscrowd,
+        }
+        return img, target
 
     def __len__(self) -> int:
-        return len(self.image_paths)
-
-    def __getitem__(self, idx: int) -> Dict:
-        path = self.image_paths[idx]
-        img_arr = _load_tif(str(path))
-        image = _to_rgb_tensor(img_arr)
-
-        _, h, w = image.shape
-        # Scale down only if long edge exceeds max_size
-        if self.max_size is not None and max(h, w) > self.max_size:
-            scale = self.max_size / max(h, w)
-            new_h = int(round(h * scale))
-            new_w = int(round(w * scale))
-            image = TF.resize(image, [new_h, new_w], antialias=True)
-            h, w = new_h, new_w
-        # Pad to size_divisibility and min_size
-        d = self.size_divisibility
-        target_h = math.ceil(h / d) * d
-        target_w = math.ceil(w / d) * d
-        if self.min_size is not None:
-            target_h = max(target_h, self.min_size)
-            target_w = max(target_w, self.min_size)
-        pad_h, pad_w = target_h - h, target_w - w
-        if pad_h > 0 or pad_w > 0:
-            image = F.pad(image, (0, pad_w, 0, pad_h), value=0.0)
-
-        image = _normalize(image)
-
-        return {
-            "image": image,
-            "file_name": path.name,
-            "orig_h": img_arr.shape[0],
-            "orig_w": img_arr.shape[1],
-            "padded_h": image.shape[1],
-            "padded_w": image.shape[2],
-        }
+        return len(self.sample_ids)
 
 
 # ---------------------------------------------------------------------------
-# Collate function
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def collate_fn(batch: List[Dict]) -> Dict:
-    """
-    Custom collate that pads variable-length mask tensors.
+def make_train_val_split(
+    root: str = config.DATA_ROOT,
+    val_ratio: float = config.VAL_SPLIT,
+    seed: int = config.SEED,
+) -> Tuple[List[str], List[str]]:
+    root_path = Path(root)
+    ids = sorted([p.name for p in root_path.iterdir() if p.is_dir()])
+    rng = random.Random(seed)
+    rng.shuffle(ids)
+    n_val = max(1, round(len(ids) * val_ratio))
+    return ids[n_val:], ids[:n_val]
 
-    Returns a dict with:
-        images:  (B, 3, H, W) float32 – padded to max H×W in batch.
-        targets: list of per-image dicts {"masks": (N,H,W), "labels": (N,)}.
-        image_ids: list of str.
-    """
-    images = []
-    targets = []
-    image_ids = []
 
-    max_h = max(item["image"].shape[1] for item in batch)
-    max_w = max(item["image"].shape[2] for item in batch)
+def collate_fn(batch):
+    return tuple(zip(*batch))
 
-    for item in batch:
-        img = item["image"]
-        _, h, w = img.shape
-        # Pad bottom-right with zero (after normalisation ≈ -mean/std)
-        pad_h = max_h - h
-        pad_w = max_w - w
-        if pad_h > 0 or pad_w > 0:
-            import torch.nn.functional as F
 
-            img = F.pad(img, (0, pad_w, 0, pad_h), value=0.0)
-
-        images.append(img)
-
-        if "masks" in item:
-            masks = item["masks"]  # (N, h, w)
-            if pad_h > 0 or pad_w > 0:
-                import torch.nn.functional as F
-
-                masks = F.pad(
-                    masks.float(), (0, pad_w, 0, pad_h), value=0.0
-                ).bool()
-            targets.append(
-                {"masks": masks, "labels": item["labels"]}
-            )
-            image_ids.append(item["image_id"])
-
-    return {
-        "images": torch.stack(images),
-        "targets": targets,
-        "image_ids": image_ids,
-    }
+def compute_class_balanced_weights(majority_classes: List[int]) -> List[float]:
+    """Inverse-frequency sample weights for WeightedRandomSampler."""
+    counts = np.bincount(majority_classes, minlength=config.NUM_CLASSES + 1).astype(np.float32)
+    counts[counts == 0] = 1.0
+    inv = 1.0 / counts
+    return [float(inv[c]) for c in majority_classes]

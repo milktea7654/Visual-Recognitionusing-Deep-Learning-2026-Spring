@@ -2,10 +2,6 @@
 torch>=2.1.0
 torchvision>=0.16.0
 
-# Hugging Face Mask2Former (includes Swin backbone)
-transformers>=4.38.0
-accelerate>=0.27.0
-
 # Image I/O (.tif support – handles LZW, BigTIFF, uint16, multi-page)
 tifffile>=2023.7.18
 imagecodecs>=2023.7.10   # required codec backend for tifffile
@@ -19,5 +15,13 @@ scipy>=1.11.0
 
 # Misc utilities
 tqdm>=4.66.0
-
 tensorboard
+
+# Heavy augmentation
+albumentations>=1.3.1
+
+# ConvNeXt-V2 backbone (ImageNet-1K weights only)
+transformers>=4.40.0
+
+# Weighted Box Fusion for ensemble inference (TTA)
+ensemble-boxes>=1.0.8

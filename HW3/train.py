@@ -1,472 +1,53 @@
 """
-train.py – Training loop for Mask2Former cell instance segmentation.
+train.py – Train ConvNeXt-Base + FPN + Mask R-CNN with SOTA tricks.
 
-Usage
------
-    python train.py                            # defaults from config.py
-    python train.py --epochs 100 --batch_size 2
+Improvements:
+* Class-balanced sampling (WeightedRandomSampler)
+* EMA model weights for evaluation / best.pt
+* Cosine LR schedule + linear warmup
+* Mixed precision + grad clip
 
-Loss design
------------
-Mask2Former's built-in loss is a weighted sum of:
+Output layout:
+    output/YYYYMMDD_HHMMSS/
+    ├── checkpoints/   (best.pt, last.pt – contains EMA state if enabled)
+    ├── logs/          (TensorBoard)
+    └── result/
 
-1. **Dice Loss** (per-query binary mask vs. GT binary mask)
-   - Smooth, gradient-friendly for sparse masks; handles class imbalance
-     because it is normalised by the sum of predictions + targets.
-
-2. **Cross-Entropy / Focal Loss** (per-pixel mask logit)
-   - ``sigmoid_focal_loss`` down-weights easy background pixels; critical when
-     cells occupy <5 % of image area.
-
-3. **Classification Cross-Entropy** (per-query class prediction)
-   - ``no_object`` weight (0.1) down-weights the ~90 dead queries per image.
-
-All three are combined inside ``Mask2FormerForUniversalSegmentation`` via
-bipartite Hungarian matching – no NMS needed.
-
-VRAM reduction strategy
------------------------
-* ``USE_AMP = True``   – fp16 autocast halves activation memory (~50 %).
-* ``IMAGE_SIZE = 384`` – reduces spatial tensors by (384/512)^2 ≈ 44 %.
-* ``MAX_INSTANCES``    – caps mask_labels tensor rows per image.
-
-Optimiser & scheduler
----------------------
-* **AdamW** with decoupled weight decay (0.05): standard for ViT/Swin models.
-* **OneCycleLR** (pct_start=0.2): 60-epoch linear warmup then cosine anneal.
-  Proven to converge faster on small datasets vs flat LR schedules.
-* Backbone is frozen for the first ``WARMUP_EPOCHS`` epochs then unfrozen.
+Usage:
+    python train.py
+    python train.py --resume output/.../checkpoints/last.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import datetime
-import random
+import io
+import math
+import sys
 import time
-from collections import deque
 from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
 import torch
-import torch.utils.data
-from torch.amp import GradScaler, autocast
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+import torch.utils.data as data
+from pycocotools import mask as coco_mask
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import config
-from dataset import CellInstanceDataset, collate_fn
-from model import Mask2FormerWrapper
-
-
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
-
-
-def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# ---------------------------------------------------------------------------
-# Smoothed metric tracking
-# ---------------------------------------------------------------------------
-
-
-class _Meter:
-    """Running-window average for a single scalar."""
-
-    def __init__(self, win: int = 20) -> None:
-        self._d: deque = deque(maxlen=win)
-        self._sum = 0.0
-        self._n = 0
-
-    def update(self, v: float, n: int = 1) -> None:
-        self._d.append(v)
-        self._sum += v * n
-        self._n += n
-
-    @property
-    def latest(self) -> float:
-        return float(self._d[-1]) if self._d else 0.0
-
-    @property
-    def median(self) -> float:
-        return float(np.median(list(self._d))) if self._d else 0.0
-
-    @property
-    def global_avg(self) -> float:
-        return self._sum / max(self._n, 1)
-
-
-# ---------------------------------------------------------------------------
-# Per-image target preparation
-# ---------------------------------------------------------------------------
-
-
-def _prepare_targets(
-    targets: List[dict],
-    device: torch.device,
-) -> tuple:
-    """
-    Convert a list of per-image target dicts to two lists accepted by HF
-    Mask2Former:
-        mask_labels:  list[(N_i, H, W) float32]
-        class_labels: list[(N_i,) int64]  – 0-indexed (class - 1)
-
-    Caps N_i at config.MAX_INSTANCES (random subset) to prevent OOM on
-    densely annotated images.
-    """
-    mask_labels = []
-    class_labels = []
-
-    for tgt in targets:
-        masks = tgt["masks"].float().to(device)   # (N, H, W)
-        labels = (tgt["labels"] - 1).long().to(device)  # (N,)
-
-        if masks.shape[0] > config.MAX_INSTANCES:
-            idx = torch.randperm(masks.shape[0], device=device)[:config.MAX_INSTANCES]
-            masks = masks[idx]
-            labels = labels[idx]
-
-        mask_labels.append(masks)
-        class_labels.append(labels)
-
-    return mask_labels, class_labels
-
-
-# ---------------------------------------------------------------------------
-# Train / val epoch runners
-# ---------------------------------------------------------------------------
-
-
-def _run_train_epoch(
-    model: Mask2FormerWrapper,
-    loader: torch.utils.data.DataLoader,
-    optimizer: AdamW,
-    scaler: GradScaler,
-    device: torch.device,
-    epoch: int,
-    total_epochs: int,
-    writer: SummaryWriter,
-    global_step: int,
-    use_amp: bool,
-) -> tuple:
-    """Run one training epoch. Returns (avg_loss, updated_global_step)."""
-    model.train()
-    meter = _Meter(win=20)
-
-    pbar = tqdm(loader, desc=f"Train {epoch:03d}/{total_epochs:03d}", leave=False)
-    for batch in pbar:
-        images = batch["images"].to(device, non_blocking=True)
-        targets = batch["targets"]
-
-        if not targets:
-            continue
-
-        mask_labels, class_labels = _prepare_targets(targets, device)
-        optimizer.zero_grad()
-
-        with autocast('cuda', enabled=use_amp):
-            outputs = model(
-                pixel_values=images,
-                mask_labels=mask_labels,
-                class_labels=class_labels,
-            )
-            loss = outputs.loss
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
-
-        loss_val = loss.item()
-        meter.update(loss_val)
-        global_step += 1
-
-        if writer is not None and global_step % 10 == 0:
-            writer.add_scalar("train/loss_step", loss_val, global_step)
-            writer.add_scalar("train/lr", optimizer.param_groups[1]["lr"], global_step)
-
-        pbar.set_postfix(
-            loss=f"{loss_val:.4f}",
-            avg=f"{meter.global_avg:.4f}",
-            lr=f"{optimizer.param_groups[1]['lr']:.2e}",
-        )
-
-    return meter.global_avg, global_step
-
-
-@torch.no_grad()
-def _run_val_epoch(
-    model: Mask2FormerWrapper,
-    loader: torch.utils.data.DataLoader,
-    device: torch.device,
-    use_amp: bool,
-    threshold: float = 0.5,
-) -> float:
-    """Quick mask-IoU AP50 estimate over the validation set."""
-    model.eval()
-    all_iou: List[float] = []
-
-    pbar = tqdm(loader, desc="Val      ", leave=False)
-    for batch in pbar:
-        images = batch["images"].to(device, non_blocking=True)
-        targets = batch["targets"]
-
-        with autocast('cuda', enabled=use_amp):
-            outputs = model(pixel_values=images)
-
-        pred_masks_logits = outputs.masks_queries_logits  # (B, Q, H/4, W/4)
-        pred_class_logits = outputs.class_queries_logits  # (B, Q, C+1)
-
-        h, w = images.shape[2], images.shape[3]
-        pred_masks = torch.nn.functional.interpolate(
-            pred_masks_logits.float(),
-            size=(h, w),
-            mode="bilinear",
-            align_corners=False,
-        ).sigmoid()  # (B, Q, H, W)
-
-        pred_scores = pred_class_logits.float().softmax(-1)
-        fg_scores, fg_labels = pred_scores[..., :-1].max(-1)  # (B, Q)
-
-        for b_idx, tgt in enumerate(targets):
-            gt_masks = tgt["masks"].to(device, non_blocking=True)
-            if gt_masks.shape[0] == 0:
-                continue
-
-            img_pred_masks = pred_masks[b_idx]
-            img_scores = fg_scores[b_idx]
-
-            keep = img_scores > threshold
-            if keep.sum() == 0:
-                all_iou.extend([0.0] * gt_masks.shape[0])
-                continue
-
-            pos_masks = (img_pred_masks[keep] > 0.5)
-
-            for gt_m in gt_masks:
-                gt_m = gt_m.bool()
-                inter = (pos_masks & gt_m.unsqueeze(0)).float().sum((-2, -1))
-                union = (pos_masks | gt_m.unsqueeze(0)).float().sum((-2, -1))
-                iou = (inter / (union + 1e-6)).max().item()
-                all_iou.append(float(iou >= 0.5))
-
-        cur_ap50 = float(np.mean(all_iou)) if all_iou else 0.0
-        pbar.set_postfix(ap50=f"{cur_ap50:.4f}")
-
-    return float(np.mean(all_iou)) if all_iou else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Training orchestration
-# ---------------------------------------------------------------------------
-
-
-def train(args: argparse.Namespace) -> None:
-    _seed_everything(config.SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-    print(f"[train] device: {device}")
-
-    # ── Datasets ────────────────────────────────────────────────────────────
-    train_dir = Path(config.DATA_ROOT)
-    all_dirs = sorted([p for p in train_dir.iterdir() if p.is_dir()])
-    n_total = len(all_dirs)
-    n_val = max(1, int(n_total * 0.2))
-    rng = torch.Generator().manual_seed(config.SEED)
-    perm = torch.randperm(n_total, generator=rng).tolist()
-    train_sample_dirs = [all_dirs[i] for i in perm[n_val:]]
-    val_sample_dirs = [all_dirs[i] for i in perm[:n_val]]
-
-    train_ds = CellInstanceDataset(
-        str(train_dir),
-        augment=True,
-        crop_size=config.CROP_SIZE,
-        min_size=config.MIN_SIZE,
-        size_divisibility=config.SIZE_DIVISIBILITY,
-    )
-    train_ds.sample_dirs = train_sample_dirs
-
-    val_ds = CellInstanceDataset(
-        str(train_dir),
-        augment=False,
-        crop_size=config.CROP_SIZE,
-        min_size=config.MIN_SIZE,
-        size_divisibility=config.SIZE_DIVISIBILITY,
-    )
-    val_ds.sample_dirs = val_sample_dirs
-
-    train_loader = torch.utils.data.DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=(4 if args.num_workers > 0 else None),
-        drop_last=True,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=(4 if args.num_workers > 0 else None),
-    )
-
-    # ── Model ────────────────────────────────────────────────────────────────
-    model = Mask2FormerWrapper(
-        pretrained=config.PRETRAINED,
-        num_classes=config.NUM_CLASSES,
-        num_queries=config.NUM_QUERIES,
-    ).to(device)
-
-    if config.WARMUP_EPOCHS > 0:
-        model.freeze_backbone()
-        print(f"[train] backbone frozen for first {config.WARMUP_EPOCHS} epochs")
-
-    # ── Optimiser ────────────────────────────────────────────────────────────
-    backbone_params = [
-        p for n, p in model.named_parameters()
-        if "pixel_level_module.encoder" in n
-    ]
-    head_params = [
-        p for n, p in model.named_parameters()
-        if "pixel_level_module.encoder" not in n
-    ]
-
-    param_groups = [
-        {"params": backbone_params, "lr": config.LR_BACKBONE},
-        {"params": head_params,     "lr": config.LR},
-    ]
-
-    if getattr(config, "OPTIMIZER", "AdamW") == "AdamW":
-        optimizer = AdamW(param_groups, weight_decay=config.WEIGHT_DECAY)
-    else:
-        # Fallback to Adam if requested
-        optimizer = torch.optim.Adam(param_groups, weight_decay=config.WEIGHT_DECAY)
-
-    if getattr(config, "SCHEDULER", "OneCycleLR") == "OneCycleLR":
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=[config.LR_BACKBONE, config.LR],
-            epochs=args.epochs,
-            steps_per_epoch=1,
-            pct_start=0.2,
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=config.LR_MIN,
-        )
-
-    use_amp = config.USE_AMP and device.type == "cuda"
-    scaler = GradScaler('cuda', enabled=use_amp)
-    print(f"[train] AMP={'on' if use_amp else 'off'}")
-
-    # ── Output dirs ──────────────────────────────────────────────────────────
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(config.OUTPUT_DIR) / stamp
-    ckpt_dir = run_dir / "checkpoints"
-    log_dir = run_dir / "logs"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(log_dir))
-    print(f"[train] run dir    → {run_dir}")
-    print(f"[train] TensorBoard → tensorboard --logdir {log_dir}")
-
-    best_ap50 = 0.0
-    best_ckpt = ckpt_dir / "best_model.pth"
-    global_step = 0
-    no_improve = 0
-    patience = getattr(config, "EARLY_STOP_PATIENCE", 20)
-
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    for epoch in range(1, args.epochs + 1):
-        if epoch == config.WARMUP_EPOCHS + 1:
-            model.unfreeze_backbone()
-            print(f"[train] epoch {epoch}: backbone unfrozen")
-
-        ep_t0 = time.time()
-
-        avg_loss, global_step = _run_train_epoch(
-            model, train_loader, optimizer, scaler,
-            device, epoch, args.epochs, writer, global_step, use_amp,
-        )
-        scheduler.step()
-
-        ap50 = _run_val_epoch(
-            model, val_loader, device, use_amp,
-            threshold=config.VAL_SCORE_THRESHOLD
-        )
-        ep_sec = int(time.time() - ep_t0)
-        lr_now = optimizer.param_groups[1]["lr"]
-
-        print(
-            f"  Epoch {epoch:03d}  train_loss={avg_loss:.4f}  "
-            f"AP50={ap50:.4f}  lr={lr_now:.2e}  ({ep_sec}s)"
-        )
-
-        if writer is not None:
-            writer.add_scalar("train/loss_epoch", avg_loss, epoch)
-            writer.add_scalar("val/AP50", ap50, epoch)
-            writer.add_scalar("train/lr_epoch", lr_now, epoch)
-
-        # Periodic checkpoint
-        if epoch % config.SAVE_EVERY == 0:
-            ckpt_path = ckpt_dir / f"checkpoint_epoch_{epoch}.pth"
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "ap50": ap50,
-                },
-                ckpt_path,
-            )
-
-        # Save best model / early stopping
-        if ap50 > best_ap50:
-            best_ap50 = ap50
-            no_improve = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "ap50": ap50,
-                },
-                best_ckpt,
-            )
-            print(f"  -> Best model saved (AP50={best_ap50:.4f})")
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                print(
-                    f"\n[train] early stopping at epoch {epoch} "
-                    f"(no AP50 improvement for {patience} epochs)"
-                )
-                break
-
-    writer.close()
-    print(f"\n[train] finished – best AP50: {best_ap50:.4f}")
+from dataset import (
+    CellInstanceDataset,
+    collate_fn,
+    compute_class_balanced_weights,
+    make_train_val_split,
+)
+from model import build_maskrcnn, build_cascade_maskrcnn, count_parameters
 
 
 # ---------------------------------------------------------------------------
@@ -474,30 +55,593 @@ def train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train Mask2Former for cell instance segmentation"
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train Mask R-CNN")
+    p.add_argument("--epochs", type=int, default=config.EPOCHS)
+    p.add_argument("--batch",  type=int, default=config.BATCH_SIZE)
+    p.add_argument("--lr",     type=float, default=config.LR)
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--imgsz",  type=int, default=None,
+                   help="Ignored (image size is set via config.CROP_SIZE)")
+    args, _ = p.parse_known_args()  # ignore unknown args gracefully
+    return args
+
+
+# ---------------------------------------------------------------------------
+# EMA
+# ---------------------------------------------------------------------------
+
+
+class ModelEMA:
+    """Track exponential moving average of model parameters and buffers."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self._step = 0
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self._step += 1
+        # Adaptive decay: ramp from ~0.5 up to config.EMA_DECAY over first 2000 steps.
+        # Prevents the EMA from being stuck near random init early in training.
+        d = min(self.decay, (1 + self._step) / (10 + self._step))
+        msd = model.state_dict()
+        for k, v in self.module.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(d).add_(msd[k].detach(), alpha=1.0 - d)
+            else:
+                v.copy_(msd[k])
+
+    def state_dict(self):
+        return self.module.state_dict()
+
+    def load_state_dict(self, sd):
+        self.module.load_state_dict(sd)
+
+
+# ---------------------------------------------------------------------------
+# COCO eval
+# ---------------------------------------------------------------------------
+
+
+def _build_coco_gt(dataset: CellInstanceDataset) -> COCO:
+    images, annotations = [], []
+    ann_id = 1
+    for idx in range(len(dataset)):
+        _img, target = dataset[idx]
+        h, w = _img.shape[-2:]
+        images.append({"id": idx, "height": h, "width": w})
+
+        boxes = target["boxes"].numpy()
+        labels = target["labels"].numpy()
+        masks = target["masks"].numpy()
+
+        for i in range(boxes.shape[0]):
+            x1, y1, x2, y2 = boxes[i].tolist()
+            rle = coco_mask.encode(np.asfortranarray(masks[i].astype(np.uint8)))
+            rle["counts"] = rle["counts"].decode("utf-8")
+            annotations.append({
+                "id": ann_id,
+                "image_id": idx,
+                "category_id": int(labels[i]),
+                "bbox": [x1, y1, x2 - x1, y2 - y1],
+                "area": float((x2 - x1) * (y2 - y1)),
+                "iscrowd": 0,
+                "segmentation": rle,
+            })
+            ann_id += 1
+
+    categories = [{"id": c, "name": f"class{c}"} for c in range(1, config.NUM_CLASSES + 1)]
+    coco_dict = {"images": images, "annotations": annotations, "categories": categories}
+
+    coco_gt = COCO()
+    coco_gt.dataset = coco_dict
+    with contextlib.redirect_stdout(io.StringIO()):
+        coco_gt.createIndex()
+    return coco_gt
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, coco_gt: COCO, score_thr: float) -> float:
+    model.eval()
+    # Temporarily lower the model's internal score threshold so low-confidence
+    # predictions are still returned and counted by COCOeval.
+    old_score_thresh = getattr(getattr(model, 'roi_heads', None), 'score_thresh', None)
+    if old_score_thresh is not None:
+        model.roi_heads.score_thresh = min(old_score_thresh, 0.01)
+    results = []
+    try:
+        for images, targets in loader:
+            images = [img.to(device) for img in images]
+            outputs = model(images)
+            for tgt, out in zip(targets, outputs):
+                img_id = int(tgt["image_id"].item())
+                scores = out["scores"].cpu().numpy()
+                labels = out["labels"].cpu().numpy()
+                masks = (out["masks"].squeeze(1) > 0.5).cpu().numpy().astype(np.uint8)
+                boxes = out["boxes"].cpu().numpy()
+
+                for i in range(scores.shape[0]):
+                    if scores[i] < score_thr:
+                        continue
+                    rle = coco_mask.encode(np.asfortranarray(masks[i]))
+                    rle["counts"] = rle["counts"].decode("utf-8")
+                    x1, y1, x2, y2 = boxes[i].tolist()
+                    results.append({
+                        "image_id": img_id,
+                        "category_id": int(labels[i]),
+                        "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        "score": float(scores[i]),
+                        "segmentation": rle,
+                    })
+
+        if not results:
+            return 0.0
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_dt = coco_gt.loadRes(results)
+            coco_eval = COCOeval(coco_gt, coco_dt, iouType="segm")
+            coco_eval.evaluate()
+            coco_eval.accumulate()
+            coco_eval.summarize()
+        return float(coco_eval.stats[1])  # AP@0.50
+    finally:
+        # Always restore original threshold
+        if old_score_thresh is not None:
+            model.roi_heads.score_thresh = old_score_thresh
+
+
+# ---------------------------------------------------------------------------
+# Sliding-window evaluation (matches test-time inference conditions)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def evaluate_sliding_window(model, val_ids: List[str], device, score_thr: float) -> float:
+    """Evaluate on full-resolution val images with sliding window.
+
+    Mirrors predict_image() in inference.py so that the val metric reflects
+    the same distribution shift the model sees at test time (full images,
+    padding of small images, sliding window for large images).
+    Only used when USE_FULL_TRAIN=False and SW_EVAL_EVERY > 0.
+    """
+    from dataset import _load_image_tif, _load_mask_tif
+    import torchvision.transforms.functional as TF_func
+    import torchvision.ops as tv_ops
+
+    model.eval()
+    old_thresh = getattr(getattr(model, "roi_heads", None), "score_thresh", None)
+    if old_thresh is not None:
+        model.roi_heads.score_thresh = min(old_thresh, 0.01)
+
+    tile = config.CROP_SIZE
+    step = int(tile * (1 - config.SLIDING_WINDOW_OVERLAP))
+    images_info: List = []
+    annotations_info: List = []
+    results: List = []
+    ann_id = 1
+
+    try:
+        for img_idx, sid in enumerate(val_ids):
+            img_path = Path(config.DATA_ROOT) / sid / "image.tif"
+            if not img_path.exists():
+                continue
+            img_np = _load_image_tif(img_path)   # (H, W, 3) uint8
+            H, W = img_np.shape[:2]
+            images_info.append({"id": img_idx, "height": H, "width": W})
+
+            # GT in full-image coordinates
+            for cls in range(1, config.NUM_CLASSES + 1):
+                mp = Path(config.DATA_ROOT) / sid / f"class{cls}.tif"
+                if not mp.exists():
+                    continue
+                mask_arr = _load_mask_tif(mp)
+                inst_ids = np.unique(mask_arr)
+                inst_ids = inst_ids[inst_ids > 0]
+                for iid in inst_ids:
+                    binary = (mask_arr == iid).astype(np.uint8)
+                    rle = coco_mask.encode(np.asfortranarray(binary))
+                    rle["counts"] = rle["counts"].decode("utf-8")
+                    ys_b, xs_b = np.where(binary)
+                    x1, y1 = int(xs_b.min()), int(ys_b.min())
+                    x2, y2 = int(xs_b.max()) + 1, int(ys_b.max()) + 1
+                    annotations_info.append({
+                        "id": ann_id, "image_id": img_idx, "category_id": cls,
+                        "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        "area": float((x2 - x1) * (y2 - y1)),
+                        "iscrowd": 0, "segmentation": rle,
+                    })
+                    ann_id += 1
+
+            # Build tile list (pad small images to tile×tile)
+            if H <= tile and W <= tile:
+                padded = np.zeros((tile, tile, 3), dtype=img_np.dtype)
+                padded[:H, :W] = img_np
+                tile_list = [(padded, 0, 0)]
+            else:
+                oys = list(range(0, max(1, H - tile + 1), step))
+                if H > tile and oys[-1] != H - tile:
+                    oys.append(H - tile)
+                oxs = list(range(0, max(1, W - tile + 1), step))
+                if W > tile and oxs[-1] != W - tile:
+                    oxs.append(W - tile)
+                tile_list = []
+                for oy in oys:
+                    for ox in oxs:
+                        patch = img_np[oy:oy + tile, ox:ox + tile]
+                        ph, pw = patch.shape[:2]
+                        if ph < tile or pw < tile:
+                            p2 = np.zeros((tile, tile, 3), dtype=patch.dtype)
+                            p2[:ph, :pw] = patch
+                            patch = p2
+                        tile_list.append((patch, oy, ox))
+
+            # Forward pass per tile
+            all_boxes: List = []
+            all_scores: List = []
+            all_labels_l: List = []
+            all_placements: List = []
+            for patch_np, oy, ox in tile_list:
+                img_t = TF_func.to_tensor(patch_np).unsqueeze(0).to(device)
+                out = model(img_t)[0]
+                boxes = out["boxes"].cpu().numpy()
+                sc = out["scores"].cpu().numpy()
+                lb = out["labels"].cpu().numpy()
+                ms = (out["masks"].squeeze(1) > 0.5).cpu().numpy().astype(np.uint8)
+                del out
+                torch.cuda.empty_cache()
+                for i in range(sc.shape[0]):
+                    if sc[i] < score_thr:
+                        continue
+                    gx1 = max(0.0, min(float(boxes[i][0]) + ox, W))
+                    gy1 = max(0.0, min(float(boxes[i][1]) + oy, H))
+                    gx2 = max(0.0, min(float(boxes[i][2]) + ox, W))
+                    gy2 = max(0.0, min(float(boxes[i][3]) + oy, H))
+                    if gx2 <= gx1 or gy2 <= gy1:
+                        continue
+                    all_boxes.append([gx1, gy1, gx2, gy2])
+                    all_scores.append(float(sc[i]))
+                    all_labels_l.append(int(lb[i]))
+                    all_placements.append((oy, ox, ms[i]))
+
+            if not all_boxes:
+                continue
+
+            # Per-class NMS
+            boxes_t = torch.tensor(all_boxes, dtype=torch.float32)
+            scores_t2 = torch.tensor(all_scores, dtype=torch.float32)
+            labels_t2 = torch.tensor(all_labels_l, dtype=torch.int64)
+            keep_indices: List[int] = []
+            for cls in range(1, config.NUM_CLASSES + 1):
+                cls_m = labels_t2 == cls
+                if cls_m.sum() == 0:
+                    continue
+                idx = torch.where(cls_m)[0]
+                k = tv_ops.nms(boxes_t[idx], scores_t2[idx], 0.5)
+                keep_indices.extend(idx[k].tolist())
+
+            for ki in keep_indices:
+                oy, ox, small_mask = all_placements[ki]
+                th, tw = small_mask.shape
+                full_mask = np.zeros((H, W), dtype=np.uint8)
+                ey = min(oy + th, H)
+                ex = min(ox + tw, W)
+                full_mask[oy:ey, ox:ex] = small_mask[:ey - oy, :ex - ox]
+                rle2 = coco_mask.encode(np.asfortranarray(full_mask))
+                rle2["counts"] = rle2["counts"].decode("utf-8")
+                b = all_boxes[ki]
+                results.append({
+                    "image_id": img_idx,
+                    "category_id": all_labels_l[ki],
+                    "bbox": [b[0], b[1], b[2] - b[0], b[3] - b[1]],
+                    "score": all_scores[ki],
+                    "segmentation": rle2,
+                })
+
+        if not results:
+            return 0.0
+
+        categories = [{"id": c, "name": f"class{c}"} for c in range(1, config.NUM_CLASSES + 1)]
+        coco_dict2 = {"images": images_info, "annotations": annotations_info, "categories": categories}
+        coco_gt_sw = COCO()
+        coco_gt_sw.dataset = coco_dict2
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_gt_sw.createIndex()
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_dt = coco_gt_sw.loadRes(results)
+            coco_eval2 = COCOeval(coco_gt_sw, coco_dt, iouType="segm")
+            coco_eval2.evaluate()
+            coco_eval2.accumulate()
+            coco_eval2.summarize()
+        return float(coco_eval2.stats[1])   # AP@0.50
+    finally:
+        if old_thresh is not None:
+            model.roi_heads.score_thresh = old_thresh
+
+
+# ---------------------------------------------------------------------------
+# LR schedule
+# ---------------------------------------------------------------------------
+
+
+def cosine_warmup_lambda(epoch: int, total: int) -> float:
+    """Linear warmup → cosine decay to LR_MIN/LR ratio."""
+    if epoch < config.WARMUP_EPOCHS:
+        return config.WARMUP_FACTOR + (1 - config.WARMUP_FACTOR) * epoch / max(1, config.WARMUP_EPOCHS)
+    progress = (epoch - config.WARMUP_EPOCHS) / max(1, total - config.WARMUP_EPOCHS)
+    progress = min(max(progress, 0.0), 1.0)
+    min_ratio = config.LR_MIN / config.LR
+    return min_ratio + 0.5 * (1 - min_ratio) * (1 + math.cos(math.pi * progress))
+
+
+# ---------------------------------------------------------------------------
+# Train one epoch
+# ---------------------------------------------------------------------------
+
+
+def train_one_epoch(
+    model, ema, optimizer, loader, device, scaler, grad_clip: float,
+) -> Dict[str, float]:
+    model.train()
+    sums: Dict[str, float] = {}
+    n_batches = 0
+
+    for images, targets in loader:
+        # filter empty-target samples (avoid boxes with zero area)
+        keep = [(i, t) for i, t in zip(images, targets) if t["boxes"].shape[0] > 0]
+        if not keep:
+            continue
+        images = [k[0].to(device) for k in keep]
+        targets = [{k2: v2.to(device) for k2, v2 in k[1].items()} for k in keep]
+
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            with torch.amp.autocast("cuda"):
+                loss_dict = model(images, targets)
+                loss = sum(loss_dict.values())
+            # Skip NaN/Inf batches before they corrupt the model
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()  # keep scaler state consistent
+                continue
+            scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss_dict = model(images, targets)
+            loss = sum(loss_dict.values())
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        if ema is not None:
+            ema.update(model)
+
+        for k, v in loss_dict.items():
+            sums[k] = sums.get(k, 0.0) + float(v.detach())
+        sums["total"] = sums.get("total", 0.0) + float(loss.detach())
+        n_batches += 1
+
+    return {k: v / max(1, n_batches) for k, v in sums.items()}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(config.OUTPUT_DIR) / timestamp
+    ckpt_dir = output_dir / "checkpoints"
+    logs_dir = output_dir / "logs"
+    result_dir = output_dir / "result"
+    for d in (ckpt_dir, logs_dir, result_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    print(f"Output → {output_dir}")
+
+    # ----- Dataset -----
+    train_ids, val_ids = make_train_val_split()
+
+    if config.USE_FULL_TRAIN:
+        # Use all images for final submission — no val split.
+        # Early stopping is disabled; model saves every SW_EVAL_EVERY epochs.
+        all_ids = val_ids + train_ids   # same deterministic order
+        train_ids = all_ids
+        val_ids = []
+        print(f"USE_FULL_TRAIN=True → {len(train_ids)} images, no val evaluation")
+    else:
+        print(f"Split: train={len(train_ids)}  val={len(val_ids)}")
+
+    train_set = CellInstanceDataset(config.DATA_ROOT, train_ids, train=True)
+
+    # Only build val infrastructure when we have val images
+    val_loader = None
+    coco_gt = None
+    if val_ids:
+        val_set = CellInstanceDataset(config.DATA_ROOT, val_ids, train=False)
+        val_loader = data.DataLoader(
+            val_set, batch_size=1, shuffle=False,
+            num_workers=config.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+        )
+        print("Building COCO ground-truth for crop-level validation...")
+        coco_gt = _build_coco_gt(val_set)
+
+    # Class-balanced sampler
+    if config.USE_CLASS_BALANCED_SAMPLER:
+        weights = compute_class_balanced_weights(train_set.majority_classes)
+        sampler = data.WeightedRandomSampler(
+            weights, num_samples=len(train_set), replacement=True,
+        )
+        shuffle = False
+        print("Using WeightedRandomSampler for class balance")
+    else:
+        sampler = None
+        shuffle = True
+
+    train_loader = data.DataLoader(
+        train_set, batch_size=args.batch, sampler=sampler, shuffle=shuffle,
+        num_workers=config.NUM_WORKERS, collate_fn=collate_fn,
+        pin_memory=True, drop_last=False,
     )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=config.EPOCHS,
-        help="total training epochs",
+
+    # ----- Model -----
+    if getattr(config, "USE_CASCADE", False):
+        model = build_cascade_maskrcnn(pretrained_backbone=True, multi_scale=True).to(device)
+        print("Architecture: Cascade Mask R-CNN (3 IoU stages: 0.5→0.6→0.7)")
+    else:
+        model = build_maskrcnn(pretrained_backbone=True, multi_scale=True).to(device)
+    n_params = count_parameters(model)
+    print(f"Model parameters: {n_params / 1e6:.2f} M  (limit 200 M)")
+    assert n_params < 200 * 1e6, "Parameter budget exceeded!"
+
+    ema = ModelEMA(model, decay=config.EMA_DECAY) if config.USE_EMA else None
+    if ema:
+        ema.module.to(device)
+        print(f"EMA enabled (decay={config.EMA_DECAY})")
+
+    # ----- Optimizer / Scheduler -----
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=config.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda e: cosine_warmup_lambda(e, args.epochs),
     )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=config.BATCH_SIZE,
-        help="images per GPU batch",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=config.NUM_WORKERS,
-        help="DataLoader workers",
-    )
-    return parser.parse_args()
+    scaler = torch.amp.GradScaler("cuda") if config.USE_AMP and device.type == "cuda" else None
+
+    # ----- Resume -----
+    start_epoch = 0
+    best_ap50 = -1.0
+    best_loss = float("inf")
+    epochs_no_improve = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        if scaler and ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        if ema and ckpt.get("ema") is not None:
+            ema.load_state_dict(ckpt["ema"])
+        start_epoch = ckpt.get("epoch", 0)
+        best_ap50 = ckpt.get("best_ap50", -1.0)
+        best_loss = ckpt.get("best_loss", float("inf"))
+        print(f"Resumed from {args.resume} (epoch={start_epoch}, best AP50={best_ap50:.4f}, best loss={best_loss:.4f})")
+
+    tb = SummaryWriter(log_dir=str(logs_dir))
+    pbar = tqdm(total=args.epochs, initial=start_epoch,
+                desc=f"Epoch[{start_epoch + 1}/{args.epochs}]",
+                unit="epoch", file=sys.stdout, leave=True)
+
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            pbar.set_description(f"Epoch[{epoch + 1}/{args.epochs}]")
+            t0 = time.time()
+            losses = train_one_epoch(
+                model, ema, optimizer, train_loader, device, scaler, config.GRAD_CLIP,
+            )
+            scheduler.step()
+            elapsed = time.time() - t0
+
+            # ---- Evaluation ----
+            # USE_FULL_TRAIN: no val set → skip evaluation, use periodic saving
+            # Otherwise: fast crop-level eval every epoch + SW eval every SW_EVAL_EVERY epochs
+            ap50 = 0.0
+            sw_ap50 = None
+            if not config.USE_FULL_TRAIN and val_loader is not None:
+                ap50 = evaluate(model, val_loader, device, coco_gt, config.VAL_SCORE_THRESHOLD)
+                sw_every = getattr(config, "SW_EVAL_EVERY", 0)
+                if sw_every > 0 and (epoch + 1) % sw_every == 0:
+                    tqdm.write(f"  Running sliding-window eval (epoch {epoch + 1})...")
+                    sw_ap50 = evaluate_sliding_window(
+                        model, val_ids, device, config.VAL_SCORE_THRESHOLD
+                    )
+                    # SW eval is the primary metric for best-checkpoint selection
+                    ap50 = sw_ap50
+
+            loss_str = "  ".join(f"{k}={v:.4f}" for k, v in losses.items() if k != "total")
+            ap_info = f"AP50={ap50:.4f}" if not config.USE_FULL_TRAIN else "AP50=N/A"
+            if sw_ap50 is not None:
+                ap_info = f"AP50(crop)={ap50:.4f}  AP50(SW)={sw_ap50:.4f}"
+            cur_total = losses.get("total", 0)
+            tqdm.write(f"Epoch[{epoch + 1}/{args.epochs}]")
+            tqdm.write(f"  total={cur_total:.4f}  {loss_str}  {ap_info}  best_loss={best_loss:.4f}  ({elapsed:.1f}s)")
+
+            for k, v in losses.items():
+                tb.add_scalar(f"train/{k}", v, epoch + 1)
+            tb.add_scalar("val/AP50", ap50, epoch + 1)
+            if sw_ap50 is not None:
+                tb.add_scalar("val/AP50_SW", sw_ap50, epoch + 1)
+            tb.add_scalar("train/best_loss", best_loss, epoch + 1)
+            tb.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+            tb.flush()
+
+            ckpt = {
+                "epoch": epoch + 1,
+                "model": model.state_dict(),
+                "ema":   ema.state_dict() if ema else None,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict() if scaler else None,
+                "best_ap50": best_ap50,
+                "best_loss": best_loss,
+                "config_backbone": config.BACKBONE_NAME,
+            }
+            torch.save(ckpt, ckpt_dir / "last.pt")
+
+            # Save best-loss checkpoint (works regardless of USE_FULL_TRAIN)
+            if cur_total < best_loss:
+                best_loss = cur_total
+                ckpt["best_loss"] = best_loss
+                torch.save(ckpt, ckpt_dir / "best_loss.pt")
+                tqdm.write(f"  -> best_loss.pt saved (loss={best_loss:.4f})")
+
+            if config.USE_FULL_TRAIN:
+                # No val metric → save every SW_EVAL_EVERY epochs as periodic checkpoint
+                every = max(1, getattr(config, "SW_EVAL_EVERY", 10))
+                if (epoch + 1) % every == 0:
+                    torch.save(ckpt, ckpt_dir / f"epoch_{epoch + 1}.pt")
+                    tqdm.write(f"  -> Checkpoint saved epoch={epoch + 1}")
+            else:
+                if ap50 > best_ap50:
+                    best_ap50 = ap50
+                    ckpt["best_ap50"] = best_ap50
+                    torch.save(ckpt, ckpt_dir / "best.pt")
+                    tqdm.write(f"  -> Best model saved (AP50={ap50:.4f})")
+                    epochs_no_improve = 0
+                else:
+                    # Only count patience once the model has produced a non-zero AP50.
+                    if best_ap50 > 0.0:
+                        epochs_no_improve += 1
+
+                if config.SAVE_EVERY > 0 and (epoch + 1) % config.SAVE_EVERY == 0:
+                    torch.save(ckpt, ckpt_dir / f"epoch_{epoch + 1}.pt")
+
+                if best_ap50 > 0.0 and epochs_no_improve >= config.EARLY_STOP_PATIENCE:
+                    tqdm.write(f"Early stopping: no AP50 improvement for {config.EARLY_STOP_PATIENCE} epochs.")
+                    break
+
+            pbar.update(1)
+
+    finally:
+        pbar.close()
+        tb.close()
+        print(f"\nTraining complete. Best AP50 = {best_ap50:.4f}  Best loss = {best_loss:.4f}")
+        print(f"Outputs → {output_dir}")
 
 
 if __name__ == "__main__":
-    train(_parse_args())
+    main()
