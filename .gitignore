@@ -26,7 +26,8 @@ build/
 **/runs/
 **/pretrained_cache/
 **/output/
-
+**/*.pt
+**/*.yaml
 # Large files
 *.zip
 *.tar.gz
