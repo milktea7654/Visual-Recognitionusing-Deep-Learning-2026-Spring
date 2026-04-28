@@ -28,6 +28,7 @@ from torchvision.models.detection._utils import (
     Matcher,
 )
 from torchvision.models.detection.anchor_utils import AnchorGenerator
+from torchvision.models.detection.mask_rcnn import MaskRCNNHeads
 from torchvision.models.detection.roi_heads import fastrcnn_loss, maskrcnn_loss
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.ops import (
@@ -474,6 +475,12 @@ def build_maskrcnn(
         min_size=min_size,
         max_size=max_size,
         mask_roi_pool=mask_roi_pool,
+    )
+    # Deeper mask head: default torchvision is 4-conv; replace with MASK_HEAD_LAYERS-conv
+    model.roi_heads.mask_head = MaskRCNNHeads(
+        config.BACKBONE_OUT_CHANNELS,
+        [256] * config.MASK_HEAD_LAYERS,
+        dilation=1,
     )
     return model
 

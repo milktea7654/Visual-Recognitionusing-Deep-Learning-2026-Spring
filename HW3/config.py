@@ -89,6 +89,8 @@ INFERENCE_MAX_SIZE = 1333
 
 # Higher mask-head resolution for sharper boundaries
 MASK_ROI_OUTPUT_SIZE = 28      # default torchvision value is 14
+# Deeper mask head: default torchvision is 4-conv layers; 6 gives sharper instance edges
+MASK_HEAD_LAYERS = 6
 
 # ---------------------------------------------------------------------------
 # Training
@@ -126,7 +128,7 @@ USE_CASCADE = True
 # Evaluation / Checkpointing
 # ---------------------------------------------------------------------------
 
-VAL_SCORE_THRESHOLD = 0.05
+VAL_SCORE_THRESHOLD = 0.01
 SAVE_EVERY = 0              # 0 = only best.pt + last.pt
 EARLY_STOP_PATIENCE = 50    # stop if AP50 does not improve for N epochs
 
@@ -139,9 +141,12 @@ SW_EVAL_EVERY = 30   # sliding-window val every N epochs (0=disabled); only when
 # Inference
 # ---------------------------------------------------------------------------
 
-USE_TTA = True          # Test-Time Augmentation: hflip, vflip (3x inference, then hard NMS)
-USE_WBF = False         # Weighted Box Fusion: disabled for now (simpler + more reliable)
-WBF_IOU_THR = 0.55      
+USE_TTA = True           # Test-Time Augmentation: hflip, vflip + scale (5× inference)
+SCALE_TTA_FACTORS = (0.8, 1.2)   # additional scale TTA (resize tile, predict, map back)
+USE_WBF = True           # Weighted Box Fusion: fuse overlapping tile/TTA boxes
+WBF_IOU_THR = 0.55
 WBF_SKIP_BOX_THR = 0.0
 WBF_WEIGHTS = [1, 1, 1]
+SOFT_NMS_SIGMA = 0.5              # Gaussian soft-NMS sigma (used when USE_WBF=False)
+SOFT_NMS_MIN_SCORE = 0.001        # minimum score after soft-NMS decay
 

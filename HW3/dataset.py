@@ -74,7 +74,7 @@ def _load_mask_tif(path: Path) -> np.ndarray:
 
 
 def _build_alb_pipeline() -> "A.Compose":
-    return A.Compose([
+    transforms = [
         A.RandomRotate90(p=0.5),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
@@ -91,7 +91,17 @@ def _build_alb_pipeline() -> "A.Compose":
         ),
         A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
         A.ElasticTransform(alpha=1, sigma=50, p=0.2),
-    ])
+    ]
+    # HED stain augmentation: simulates H&E staining variation across slides
+    # Requires albumentations >= 1.3; gracefully skipped on older versions
+    if hasattr(A, "HEDShift"):
+        transforms.append(A.HEDShift(
+            haematoxylin_bias_range=(-0.1, 0.1),
+            eosin_bias_range=(-0.1, 0.1),
+            dab_bias_range=(-0.1, 0.1),
+            p=0.3,
+        ))
+    return A.Compose(transforms)
 
 
 # ---------------------------------------------------------------------------
