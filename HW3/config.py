@@ -135,7 +135,7 @@ EARLY_STOP_PATIENCE = 50    # stop if AP50 does not improve for N epochs
 # Full-train mode: use all 209 images (no val split), save every N epochs.
 # Best for final submission – no val feedback but more training data.
 USE_FULL_TRAIN = True
-SW_EVAL_EVERY = 30   # sliding-window val every N epochs (0=disabled); only when not USE_FULL_TRAIN
+SW_EVAL_EVERY = 100   # sliding-window val every N epochs (0=disabled); only when not USE_FULL_TRAIN
 
 # ---------------------------------------------------------------------------
 # Inference

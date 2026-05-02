@@ -389,24 +389,27 @@ def train_one_epoch(
     model.train()
     sums: Dict[str, float] = {}
     n_batches = 0
+    skipped_empty_loss = 0
+    skipped_nonfinite = 0
 
     for images, targets in loader:
-        # filter empty-target samples (avoid boxes with zero area)
-        keep = [(i, t) for i, t in zip(images, targets) if t["boxes"].shape[0] > 0]
-        if not keep:
-            continue
-        images = [k[0].to(device) for k in keep]
-        targets = [{k2: v2.to(device) for k2, v2 in k[1].items()} for k in keep]
+        images = [img.to(device, non_blocking=True) for img in images]
+        targets = [
+            {name: value.to(device, non_blocking=True) for name, value in target.items()}
+            for target in targets
+        ]
 
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
             with torch.amp.autocast("cuda"):
                 loss_dict = model(images, targets)
+                if not loss_dict:
+                    skipped_empty_loss += 1
+                    continue
                 loss = sum(loss_dict.values())
-            # Skip NaN/Inf batches before they corrupt the model
             if not torch.isfinite(loss):
                 optimizer.zero_grad(set_to_none=True)
-                scaler.update()  # keep scaler state consistent
+                skipped_nonfinite += 1
                 continue
             scaler.scale(loss).backward()
             if grad_clip > 0:
@@ -416,9 +419,13 @@ def train_one_epoch(
             scaler.update()
         else:
             loss_dict = model(images, targets)
+            if not loss_dict:
+                skipped_empty_loss += 1
+                continue
             loss = sum(loss_dict.values())
             if not torch.isfinite(loss):
                 optimizer.zero_grad(set_to_none=True)
+                skipped_nonfinite += 1
                 continue
             loss.backward()
             if grad_clip > 0:
@@ -433,7 +440,21 @@ def train_one_epoch(
         sums["total"] = sums.get("total", 0.0) + float(loss.detach())
         n_batches += 1
 
-    return {k: v / max(1, n_batches) for k, v in sums.items()}
+    if n_batches == 0:
+        return {
+            "total": float("nan"),
+            "_updates": 0.0,
+            "_skipped_empty_loss": float(skipped_empty_loss),
+            "_skipped_nonfinite": float(skipped_nonfinite),
+        }
+
+    out = {k: v / n_batches for k, v in sums.items()}
+    out["_updates"] = float(n_batches)
+    if skipped_empty_loss:
+        out["_skipped_empty_loss"] = float(skipped_empty_loss)
+    if skipped_nonfinite:
+        out["_skipped_nonfinite"] = float(skipped_nonfinite)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +560,9 @@ def main() -> None:
         start_epoch = ckpt.get("epoch", 0)
         best_ap50 = ckpt.get("best_ap50", -1.0)
         best_loss = ckpt.get("best_loss", float("inf"))
+        if not math.isfinite(best_loss) or best_loss <= 0.0:
+            print(f"Ignoring invalid best_loss={best_loss:.4f} from checkpoint")
+            best_loss = float("inf")
         print(f"Resumed from {args.resume} (epoch={start_epoch}, best AP50={best_ap50:.4f}, best loss={best_loss:.4f})")
 
     tb = SummaryWriter(log_dir=str(logs_dir))
@@ -572,16 +596,24 @@ def main() -> None:
                     # SW eval is the primary metric for best-checkpoint selection
                     ap50 = sw_ap50
 
-            loss_str = "  ".join(f"{k}={v:.4f}" for k, v in losses.items() if k != "total")
+            loss_str = "  ".join(
+                f"{k}={v:.4f}" for k, v in losses.items()
+                if k != "total" and not k.startswith("_")
+            )
+            train_stats = "  ".join(
+                f"{k[1:]}={int(v)}" for k, v in losses.items()
+                if k.startswith("_")
+            )
             ap_info = f"AP50={ap50:.4f}" if not config.USE_FULL_TRAIN else "AP50=N/A"
             if sw_ap50 is not None:
                 ap_info = f"AP50(crop)={ap50:.4f}  AP50(SW)={sw_ap50:.4f}"
-            cur_total = losses.get("total", 0)
+            cur_total = float(losses.get("total", float("nan")))
+            train_info = f"{loss_str}  {train_stats}" if train_stats else loss_str
             tqdm.write(f"Epoch[{epoch + 1}/{args.epochs}]")
-            tqdm.write(f"  total={cur_total:.4f}  {loss_str}  {ap_info}  best_loss={best_loss:.4f}  ({elapsed:.1f}s)")
+            tqdm.write(f"  total={cur_total:.4f}  {train_info}  {ap_info}  best_loss={best_loss:.4f}  ({elapsed:.1f}s)")
 
             for k, v in losses.items():
-                tb.add_scalar(f"train/{k}", v, epoch + 1)
+                tb.add_scalar(f"train/{k.lstrip('_')}", v, epoch + 1)
             tb.add_scalar("val/AP50", ap50, epoch + 1)
             if sw_ap50 is not None:
                 tb.add_scalar("val/AP50_SW", sw_ap50, epoch + 1)
@@ -603,7 +635,7 @@ def main() -> None:
             torch.save(ckpt, ckpt_dir / "last.pt")
 
             # Save best-loss checkpoint (works regardless of USE_FULL_TRAIN)
-            if cur_total < best_loss:
+            if math.isfinite(cur_total) and cur_total < best_loss:
                 best_loss = cur_total
                 ckpt["best_loss"] = best_loss
                 torch.save(ckpt, ckpt_dir / "best_loss.pt")
